@@ -1,0 +1,12 @@
+[package]
+name = "base32768"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+phf = { version = "0.12", features = ["macros"] }
+itertools = "0.14"
+thiserror = "2"
+
+[build-dependencies]
+const-gen = { git = "https://github.com/EEWBot/const-gen", branch = "feat/add-char-support" }
