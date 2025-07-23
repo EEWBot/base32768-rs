@@ -9,4 +9,4 @@ itertools = "0.14"
 thiserror = "2"
 
 [build-dependencies]
-const-gen = { git = "https://github.com/EEWBot/const-gen", branch = "feat/add-char-support" }
+const-gen = { git = "https://github.com/Eolu/const-gen", commit = "17e8b6be8bcce8f412ed8f41fa119a6033dd9008" }
