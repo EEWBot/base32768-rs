@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-phf = { version = "0.12", features = ["macros"] }
+phf = { version = "0.13", features = ["macros"] }
 itertools = "0.14"
 thiserror = "2"
 
