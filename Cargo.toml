@@ -12,7 +12,7 @@ thiserror = "2"
 const-gen = "1.6.8"
 
 [dev-dependencies]
-criterion = { version = "0.7", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 
 [[bench]]
 name = "benchmark"
