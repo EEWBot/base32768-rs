@@ -17,7 +17,7 @@ fn criterion_benchmark(c: &mut Criterion) {
     let ten_kilobytes_string = base32768::encode(&ten_kilobytes_array);
     let one_megabytes_string = base32768::encode(&one_megabytes_array);
 
-    let mut group = c.benchmark_group("base32758");
+    let mut group = c.benchmark_group("base32768");
     group.throughput(criterion::Throughput::Elements(1));
 
     group.bench_function("encoderOneByte", |b| {
