@@ -3,17 +3,23 @@ name = "base32768"
 version = "0.1.0"
 edition = "2024"
 
+[workspace]
+members = ["base32768-table"]
+
 [dependencies]
 phf = { version = "0.13", features = ["macros"] }
 itertools = "0.14"
 thiserror = "2"
-
-[build-dependencies]
-const-gen = "1.6.8"
+base32768-table = { path = "base32768-table" }
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }
+datatest-stable = "0.3.3"
 
 [[bench]]
 name = "benchmark"
+harness = false
+
+[[test]]
+name = "pairs"
 harness = false

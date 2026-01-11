@@ -3,7 +3,7 @@ use thiserror::Error;
 const BITS_PER_CHAR: u8 = 15;
 const BITS_PER_BYTE: u8 = 8;
 
-mod table;
+use base32768_table as table;
 
 #[derive(Error, Debug)]
 pub enum DecodeError {

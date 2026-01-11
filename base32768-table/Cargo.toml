@@ -1,0 +1,10 @@
+[package]
+name = "base32768-table"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+phf = { version = "0.13", features = ["macros"] }
+
+[build-dependencies]
+const-gen = "1.6.8"
