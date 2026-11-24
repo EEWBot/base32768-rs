@@ -83,6 +83,41 @@ fn main() {
         decode[cp as usize] = 0x8000 | z as u16;
     }
 
+    // Page + rank tables for the AVX-512 decode path. A page is 1024 code
+    // points (32 blocks) and its 32-bit bitmap marks the 15-bit blocks. The z
+    // of a code point is 32 * (number of 15-bit blocks below its block) +
+    // cp % 32, which holds because the blocks are in ascending order. Only 16
+    // distinct bitmaps occur, so each page stores the number of blocks before
+    // it and a pattern id; each pattern is split into two 16-block halves.
+    assert!(z15_blocks.is_sorted());
+    let mut bitmaps = [0u32; 64];
+    for &cp in &z15_blocks {
+        bitmaps[(cp >> 10) as usize] |= 1 << ((cp >> BLOCK_BITS) & 31);
+    }
+    let mut patterns: Vec<u32> = vec![];
+    let mut page_desc = vec![0u16; 64];
+    let mut prefix = 0u32;
+    for (page, &bitmap) in bitmaps.iter().enumerate() {
+        let id = match patterns.iter().position(|&x| x == bitmap) {
+            Some(i) => i,
+            None => {
+                patterns.push(bitmap);
+                patterns.len() - 1
+            }
+        };
+        page_desc[page] = (prefix << 5 | (id as u32) << 1) as u16;
+        prefix += bitmap.count_ones();
+    }
+    // The pattern id and half bit must fit the 5-bit `vpermw` index.
+    assert!(patterns.len() <= 16, "{} bitmap patterns", patterns.len());
+    let mut half_mask = vec![0u16; 32];
+    let mut half_prefix = vec![0u16; 32];
+    for (id, &bitmap) in patterns.iter().enumerate() {
+        half_mask[2 * id] = bitmap as u16;
+        half_mask[2 * id + 1] = (bitmap >> 16) as u16;
+        half_prefix[2 * id + 1] = (bitmap & 0xFFFF).count_ones() as u16;
+    }
+
     // Encode tables: packed UTF-8 for every value.
     let expand =
         |blocks: &[u32]| -> Vec<u32> { chars(blocks).into_iter().map(packed_utf8).collect() };
@@ -111,6 +146,28 @@ fn main() {
         "DECODE",
         "u16",
         &decode,
+    );
+
+    write_array(
+        &mut out,
+        "/// Per 1024-code-point page: `15-bit blocks before the page << 5 | pattern << 1`.",
+        "PAGE_DESC",
+        "u16",
+        &page_desc,
+    );
+    write_array(
+        &mut out,
+        "/// 15-bit block bitmap of a half page (16 blocks), indexed by `pattern << 1 | half`.",
+        "HALF_MASK",
+        "u16",
+        &half_mask,
+    );
+    write_array(
+        &mut out,
+        "/// 15-bit blocks in the first half of the page, indexed like `HALF_MASK`.",
+        "HALF_PREFIX",
+        "u16",
+        &half_prefix,
     );
 
     std::fs::write(
