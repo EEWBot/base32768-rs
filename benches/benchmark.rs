@@ -3,16 +3,8 @@ use std::hint::black_box;
 
 fn criterion_benchmark(c: &mut Criterion) {
     let one_byte_array: [u8; 1] = [127];
-    let ten_kilobytes_array: [u8; 10_000] = (0..10_000)
-        .map(|i| (i & 0xff) as u8)
-        .collect::<Vec<_>>()
-        .try_into()
-        .unwrap();
-    let one_megabytes_array: [u8; 1_000_000] = (0..1_000_000)
-        .map(|i| (i & 0xff) as u8)
-        .collect::<Vec<_>>()
-        .try_into()
-        .unwrap();
+    let ten_kilobytes_array: Vec<u8> = (0..10_000).map(|i| (i & 0xff) as u8).collect();
+    let one_megabytes_array: Vec<u8> = (0..1_000_000).map(|i| (i & 0xff) as u8).collect();
     let one_byte_string = base32768::encode(&one_byte_array);
     let ten_kilobytes_string = base32768::encode(&ten_kilobytes_array);
     let one_megabytes_string = base32768::encode(&one_megabytes_array);

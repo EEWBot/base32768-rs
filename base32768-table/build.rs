@@ -1,52 +1,90 @@
-use std::collections::HashMap;
+use std::fmt::Write;
 
-use const_gen::*;
+const Z15_CHAR_RANGES: &str = "ҠҿԀԟڀڿݠޟ߀ߟကဟႠႿᄀᅟᆀᆟᇠሿበቿዠዿጠጿᎠᏟᐠᙟᚠᛟកសᠠᡟᣀᣟᦀᦟ᧠᧿ᨠᨿᯀᯟᰀᰟᴀᴟ⇠⇿⋀⋟⍀⏟␀␟─❟➀➿⠀⥿⦠⦿⨠⩟⪀⪿⫠⭟ⰀⰟⲀⳟⴀⴟⵀⵟ⺠⻟㇀㇟㐀䶟䷀龿ꀀꑿ꒠꒿ꔀꗿꙀꙟꚠꛟ꜀ꝟꞀꞟꡀꡟ";
+const Z7_CHAR_RANGES: &str = "ƀƟɀʟ";
 
-const Z15_CHAR_RANGES: &'static str = "ҠҿԀԟڀڿݠޟ߀ߟကဟႠႿᄀᅟᆀᆟᇠሿበቿዠዿጠጿᎠᏟᐠᙟᚠᛟកសᠠᡟᣀᣟᦀᦟ᧠᧿ᨠᨿᯀᯟᰀᰟᴀᴟ⇠⇿⋀⋟⍀⏟␀␟─❟➀➿⠀⥿⦠⦿⨠⩟⪀⪿⫠⭟ⰀⰟⲀⳟⴀⴟⵀⵟ⺠⻟㇀㇟㐀䶟䷀龿ꀀꑿ꒠꒿ꔀꗿꙀꙟꚠꛟ꜀ꝟꞀꞟꡀꡟ";
-const Z7_CHAR_RANGES: &'static str = "ƀƟɀʟ";
+/// Every repertoire range starts and ends on a 32-codepoint boundary, so the
+/// repertoires can be described as a list of 32-character blocks.
+const BLOCK_BITS: u32 = 5;
+const BLOCK_SIZE: u32 = 1 << BLOCK_BITS;
 
-fn ranges_to_encode_repertoire(ranges: &'static str) -> Vec<char> {
-    let ranges: Vec<_> = ranges.chars().collect();
+/// Returns the first code point of each 32-character block, in repertoire order.
+fn ranges_to_blocks(ranges: &str) -> Vec<u32> {
+    let ranges: Vec<u32> = ranges.chars().map(u32::from).collect();
+    assert!(ranges.len().is_multiple_of(2));
 
-    if ranges.len() % 2 != 0 {
-        panic!();
+    let mut blocks = vec![];
+    for &[first, last] in ranges.as_chunks::<2>().0 {
+        assert_eq!(first % BLOCK_SIZE, 0, "range start U+{first:04X} not block aligned");
+        assert_eq!((last + 1) % BLOCK_SIZE, 0, "range end U+{last:04X} not block aligned");
+        blocks.extend((first..=last).step_by(BLOCK_SIZE as usize));
     }
+    blocks
+}
 
-    let mut repertoire = vec![];
+/// Packs the UTF-8 form of `cp` as little-endian bytes in the low 24 bits and
+/// its byte length in the top 8 bits.
+fn packed_utf8(cp: u32) -> u32 {
+    let mut buf = [0u8; 4];
+    let len = char::from_u32(cp).unwrap().encode_utf8(&mut buf).len();
+    assert!(len == 2 || len == 3, "U+{cp:04X} must be 2 or 3 bytes in UTF-8");
+    u32::from_le_bytes(buf) | (len as u32) << 24
+}
 
-    ranges.chunks_exact(2).for_each(|pair| {
-        repertoire.extend(pair[0]..=pair[1]);
-    });
-
-    repertoire
+fn write_array<T: std::fmt::LowerHex>(out: &mut String, doc: &str, name: &str, ty: &str, values: &[T]) {
+    writeln!(out, "{doc}").unwrap();
+    writeln!(out, "pub const {name}: [{ty}; {}] = [", values.len()).unwrap();
+    for chunk in values.chunks(16) {
+        let line: Vec<String> = chunk.iter().map(|v| format!("{v:#x}")).collect();
+        writeln!(out, "    {},", line.join(", ")).unwrap();
+    }
+    writeln!(out, "];").unwrap();
 }
 
 fn main() {
-    let mut decode_lookup_table: HashMap<char, (u8, u16)> = HashMap::new();
+    let z15_blocks = ranges_to_blocks(Z15_CHAR_RANGES);
+    let z7_blocks = ranges_to_blocks(Z7_CHAR_RANGES);
+    assert_eq!(z15_blocks.len(), (1 << 15) / BLOCK_SIZE as usize);
+    assert_eq!(z7_blocks.len(), (1 << 7) / BLOCK_SIZE as usize);
 
-    let z15_repertoire = ranges_to_encode_repertoire(Z15_CHAR_RANGES);
+    // Decode table indexed by `code_point >> 5`.
+    // 0xFFFF = not a Base32768 character, 0x8000 | z = 7-bit block, z = 15-bit block.
+    let max_cp = z15_blocks.iter().chain(&z7_blocks).max().unwrap() + BLOCK_SIZE - 1;
+    let mut decode = vec![0xFFFFu16; (max_cp >> BLOCK_BITS) as usize + 1];
+    for (i, &cp) in z15_blocks.iter().enumerate() {
+        decode[(cp >> BLOCK_BITS) as usize] = (i as u32 * BLOCK_SIZE) as u16;
+    }
+    for (i, &cp) in z7_blocks.iter().enumerate() {
+        decode[(cp >> BLOCK_BITS) as usize] = 0x8000 | (i as u32 * BLOCK_SIZE) as u16;
+    }
 
-    z15_repertoire.iter().enumerate().for_each(|(z, chr)| {
-        decode_lookup_table.insert(*chr, (15, z as u16));
-    });
+    let z15_utf8: Vec<u32> = z15_blocks.iter().map(|&cp| packed_utf8(cp)).collect();
+    let z7_utf8: Vec<u32> = z7_blocks.iter().map(|&cp| packed_utf8(cp)).collect();
 
-    let z7_repertoire = ranges_to_encode_repertoire(Z7_CHAR_RANGES);
+    let mut out = String::new();
+    writeln!(out, "pub const BLOCK_BITS: u32 = {BLOCK_BITS};").unwrap();
+    write_array(
+        &mut out,
+        "/// Packed UTF-8 (`len << 24 | le_bytes`) of the first character of each 15-bit block.",
+        "Z15_BLOCK_UTF8",
+        "u32",
+        &z15_utf8,
+    );
+    write_array(
+        &mut out,
+        "/// Packed UTF-8 (`len << 24 | le_bytes`) of the first character of each 7-bit block.",
+        "Z7_BLOCK_UTF8",
+        "u32",
+        &z7_utf8,
+    );
+    write_array(
+        &mut out,
+        "/// `code_point >> 5` -> 0xFFFF (invalid), `0x8000 | z` (7-bit) or `z` (15-bit), where z is the block's first value.",
+        "DECODE_BLOCK",
+        "u16",
+        &decode,
+    );
 
-    z7_repertoire.iter().enumerate().for_each(|(z, chr)| {
-        decode_lookup_table.insert(*chr, (7, z as u16));
-    });
-
-    let const_declarations = [
-        const_declaration!(pub Z15_REPERTOIRE = z15_repertoire),
-        const_declaration!(pub Z7_REPERTOIRE = z7_repertoire),
-        const_declaration!(pub DECODE_LOOKUP_TABLE = decode_lookup_table),
-    ]
-    .join("\n");
-
-    std::fs::write(
-        format!("{}/table.rs", std::env::var("OUT_DIR").unwrap()),
-        const_declarations,
-    )
-    .unwrap();
+    std::fs::write(format!("{}/table.rs", std::env::var("OUT_DIR").unwrap()), out).unwrap();
     println!("cargo::rerun-if-changed=build.rs");
 }

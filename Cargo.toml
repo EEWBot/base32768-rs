@@ -7,8 +7,6 @@ edition = "2024"
 members = ["base32768-table"]
 
 [dependencies]
-phf = { version = "0.13", features = ["macros"] }
-itertools = "0.14"
 thiserror = "2"
 base32768-table = { path = "base32768-table" }
 
