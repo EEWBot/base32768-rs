@@ -28,21 +28,13 @@ const FLAG7: u32 = 0x8000;
 /// Packed UTF-8 (`len << 24 | le_bytes`) of the character for the 15-bit value `z`.
 #[inline(always)]
 fn z15_utf8(z: u32) -> u32 {
-    utf8_in_block(table::Z15_BLOCK_UTF8[(z >> table::BLOCK_BITS) as usize & 0x3FF], z)
+    table::Z15_UTF8[z as usize & 0x7FFF]
 }
 
 /// Packed UTF-8 of the character for the 7-bit value `z`.
 #[inline(always)]
 fn z7_utf8(z: u32) -> u32 {
-    utf8_in_block(table::Z7_BLOCK_UTF8[(z >> table::BLOCK_BITS) as usize & 0x3], z)
-}
-
-/// Every block starts at a multiple of 32, so the offset within the block only
-/// ever lands in the low 5 bits of the final UTF-8 byte (no carry).
-#[inline(always)]
-fn utf8_in_block(first: u32, z: u32) -> u32 {
-    let len = first >> 24;
-    first + ((z & BLOCK_MASK) << (8 * len - 8))
+    table::Z7_UTF8[z as usize & 0x7F]
 }
 
 /// Writes a packed character as 4 bytes and returns the new position. Only the
@@ -53,7 +45,11 @@ fn utf8_in_block(first: u32, z: u32) -> u32 {
 /// `dst + pos .. dst + pos + 4` must be writable.
 #[inline(always)]
 unsafe fn put(dst: *mut u8, pos: usize, packed: u32) -> usize {
-    unsafe { dst.add(pos).cast::<[u8; 4]>().write_unaligned(packed.to_le_bytes()) };
+    unsafe {
+        dst.add(pos)
+            .cast::<[u8; 4]>()
+            .write_unaligned(packed.to_le_bytes())
+    };
     pos + (packed >> 24) as usize
 }
 
@@ -128,10 +124,21 @@ pub fn encode(b: &[u8]) -> String {
 /// Returns `INVALID`, `FLAG7 | z` or `z`.
 #[inline(always)]
 fn lookup(cp: u32) -> u32 {
-    match table::DECODE_BLOCK.get((cp >> table::BLOCK_BITS) as usize) {
-        Some(&base) if base as u32 != INVALID => base as u32 + (cp & BLOCK_MASK),
-        _ => INVALID,
-    }
+    // The table spans all of U+0000..=U+FFFF, so the mask removes the bounds
+    // check. Block bases are multiples of 32, so OR-ing in the offset equals
+    // adding it, and INVALID (0xFFFF) stays INVALID.
+    let base = table::DECODE_BLOCK[(cp >> table::BLOCK_BITS) as usize & 0x7FF] as u32;
+    base | (cp & BLOCK_MASK)
+}
+
+/// Decodes a character known to be a 3 byte UTF-8 sequence.
+///
+/// # Safety
+/// `p .. p + 3` must be readable.
+#[inline(always)]
+unsafe fn read_3byte(p: *const u8) -> u32 {
+    let (b0, b1, b2) = unsafe { (*p as u32, *p.add(1) as u32, *p.add(2) as u32) };
+    lookup(((b0 & 0x0F) << 12) | ((b1 & 0x3F) << 6) | (b2 & 0x3F))
 }
 
 /// Decodes one character at `p` assuming it is a 2 or 3 byte UTF-8 sequence.
@@ -177,21 +184,44 @@ pub fn decode(s: &str) -> Result<Vec<u8>, DecodeError> {
             // so all reads stay within `pos .. pos + 24 <= len`.
             let (v0, v1, v2, v3, v4, v5, v6, v7, next) = unsafe {
                 let p = src.add(pos);
-                let (v0, n0) = read_z15(p);
-                let (v1, n1) = read_z15(p.add(n0));
-                let o = n0 + n1;
-                let (v2, n2) = read_z15(p.add(o));
-                let o = o + n2;
-                let (v3, n3) = read_z15(p.add(o));
-                let o = o + n3;
-                let (v4, n4) = read_z15(p.add(o));
-                let o = o + n4;
-                let (v5, n5) = read_z15(p.add(o));
-                let o = o + n5;
-                let (v6, n6) = read_z15(p.add(o));
-                let o = o + n6;
-                let (v7, n7) = read_z15(p.add(o));
-                (v0, v1, v2, v3, v4, v5, v6, v7, pos + o + n7)
+
+                // Common case (~95% of blocks for random data, since 99.3% of
+                // 15-bit characters are 3 bytes): eight 3-byte characters at
+                // fixed offsets, so the loads and lookups do not depend on
+                // each other.
+                let (l0, l1, l2, l3) = (*p, *p.add(3), *p.add(6), *p.add(9));
+                let (l4, l5, l6, l7) = (*p.add(12), *p.add(15), *p.add(18), *p.add(21));
+                let and = l0 & l1 & l2 & l3 & l4 & l5 & l6 & l7;
+                let or = l0 | l1 | l2 | l3 | l4 | l5 | l6 | l7;
+                if and >= 0xE0 && or <= 0xEF {
+                    (
+                        read_3byte(p),
+                        read_3byte(p.add(3)),
+                        read_3byte(p.add(6)),
+                        read_3byte(p.add(9)),
+                        read_3byte(p.add(12)),
+                        read_3byte(p.add(15)),
+                        read_3byte(p.add(18)),
+                        read_3byte(p.add(21)),
+                        pos + 24,
+                    )
+                } else {
+                    let (v0, n0) = read_z15(p);
+                    let (v1, n1) = read_z15(p.add(n0));
+                    let o = n0 + n1;
+                    let (v2, n2) = read_z15(p.add(o));
+                    let o = o + n2;
+                    let (v3, n3) = read_z15(p.add(o));
+                    let o = o + n3;
+                    let (v4, n4) = read_z15(p.add(o));
+                    let o = o + n4;
+                    let (v5, n5) = read_z15(p.add(o));
+                    let o = o + n5;
+                    let (v6, n6) = read_z15(p.add(o));
+                    let o = o + n6;
+                    let (v7, n7) = read_z15(p.add(o));
+                    (v0, v1, v2, v3, v4, v5, v6, v7, pos + o + n7)
+                }
             };
 
             if (v0 | v1 | v2 | v3 | v4 | v5 | v6 | v7) & FLAG7 != 0 {
@@ -229,7 +259,10 @@ pub fn decode(s: &str) -> Result<Vec<u8>, DecodeError> {
     while pos < len {
         let b0 = bytes[pos] as u32;
         let (v, width) = match b0 {
-            0xC0..=0xDF => (lookup(((b0 & 0x1F) << 6) | (bytes[pos + 1] as u32 & 0x3F)), 2),
+            0xC0..=0xDF => (
+                lookup(((b0 & 0x1F) << 6) | (bytes[pos + 1] as u32 & 0x3F)),
+                2,
+            ),
             0xE0..=0xEF => (
                 lookup(
                     ((b0 & 0x0F) << 12)
@@ -288,7 +321,9 @@ mod tests {
 
     #[test]
     fn roundtrip_all_lengths() {
-        let data: Vec<u8> = (0..400u32).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8).collect();
+        let data: Vec<u8> = (0..400u32)
+            .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
+            .collect();
         for n in 0..data.len() {
             let encoded = crate::encode(&data[..n]);
             assert_eq!(crate::decode(&encoded).unwrap(), &data[..n], "length {n}");
@@ -311,12 +346,18 @@ mod tests {
             let mut c = chars.clone();
             c[i] = 'A';
             let s: String = c.iter().collect();
-            assert!(matches!(crate::decode(&s), Err(UnrecognizedCharacter('A'))), "{i}");
+            assert!(
+                matches!(crate::decode(&s), Err(UnrecognizedCharacter('A'))),
+                "{i}"
+            );
 
             let mut c = chars.clone();
             c[i] = '😀';
             let s: String = c.iter().collect();
-            assert!(matches!(crate::decode(&s), Err(UnrecognizedCharacter('😀'))), "{i}");
+            assert!(
+                matches!(crate::decode(&s), Err(UnrecognizedCharacter('😀'))),
+                "{i}"
+            );
 
             if i + 1 < chars.len() {
                 let mut c = chars.clone();
