@@ -374,26 +374,28 @@ unsafe fn decode_fast<const SIMD: bool, const AVX512: bool>(
     let len = bytes.len();
     let mut pos = 0usize;
     let mut written = 0usize;
-    // After the AVX-512 path rejects a window, the 8-character path takes the
-    // next few blocks (past the character it stopped at) before it is retried.
-    #[cfg(target_arch = "x86_64")]
-    let mut skip = 0u32;
 
     while pos + 24 <= len {
         #[cfg(target_arch = "x86_64")]
-        if AVX512 {
-            if skip == 0 && pos + 96 <= len {
-                // SAFETY: `pos + 96 <= len`. Those 96 input bytes account for
-                // 48 * 15 / 8 = 90 bytes of `dst` capacity (2 bytes per
-                // character), more than the 60 bytes written.
-                if unsafe { simd::decode32_avx512(src.add(pos), dst.add(written)) } {
-                    pos += 96;
-                    written += 60;
-                    continue;
-                }
-                skip = 4;
+        if AVX512 && pos + 96 <= len {
+            // SAFETY: `pos + 96 <= len`. Those 96 input bytes account for
+            // 48 * 15 / 8 = 90 bytes of `dst` capacity (2 bytes per
+            // character), more than the 60 bytes written.
+            let groups = unsafe { simd::decode32_avx512(src.add(pos), dst.add(written)) };
+            // A separate branch for a whole window keeps the next position
+            // independent of the vector computation, so windows overlap.
+            if groups == 4 {
+                pos += 96;
+                written += 60;
+                continue;
             }
-            skip = skip.saturating_sub(1);
+            core::hint::cold_path();
+            // Keep the leading groups that were decoded; the 8-character path
+            // below takes the block with the rejected character, and the next
+            // iteration retries AVX-512. `pos + 24 <= len` still holds since
+            // `groups <= 3`.
+            pos += 24 * groups;
+            written += 15 * groups;
         }
         // SAFETY: `pos + 24 <= len`.
         let (v, n) = unsafe { read_8::<SIMD>(src.add(pos)) };
@@ -466,13 +468,14 @@ unsafe fn decode_fast_dispatch<const LEVEL: u8>(
 /// Code points of eight 3-byte UTF-8 characters at `p .. p + 24`, or `None` if
 /// any of the eight lead bytes is not a 3-byte lead (0xE0..=0xEF).
 mod simd {
-    /// Decodes 32 three-byte 15-bit characters at `p .. p + 96` into 60 bytes
-    /// at `d`. Returns false, having written nothing, if any character is not
-    /// a 3-byte 15-bit character.
+    /// Decodes up to 32 three-byte 15-bit characters at `p .. p + 96`.
+    /// Returns how many leading 8-character groups (0..=4) hold only 3-byte
+    /// 15-bit characters; those groups are written to `d` as 15 bytes each,
+    /// and nothing else is written.
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx512f,avx512bw,avx512vbmi,avx512bitalg")]
     #[inline]
-    pub unsafe fn decode32_avx512(p: *const u8, d: *mut u8) -> bool {
+    pub unsafe fn decode32_avx512(p: *const u8, d: *mut u8) -> usize {
         use crate::table;
         use core::arch::x86_64::*;
 
@@ -532,9 +535,9 @@ mod simd {
         };
         const EVEN: u64 = 0x5555_5555_5555_5555;
         let b0 = _mm512_maskz_permutex2var_epi8(EVEN, a, ld(I0.as_ptr()), b);
-        if _mm512_cmpeq_epi16_mask(_mm512_and_si512(b0, w(0xF0)), w(0xE0)) != u32::MAX {
-            return false;
-        }
+        // Lanes from a character that is not 3 bytes long on are misaligned
+        // and decode to garbage, but they are never stored (see `valid`).
+        let lead_ok = _mm512_cmpeq_epi16_mask(_mm512_and_si512(b0, w(0xF0)), w(0xE0));
         let b1 = _mm512_maskz_permutex2var_epi8(EVEN, a, ld(I1.as_ptr()), b);
         let b2 = _mm512_maskz_permutex2var_epi8(EVEN, a, ld(I2.as_ptr()), b);
         let cp = _mm512_or_si512(
@@ -557,8 +560,12 @@ mod simd {
         let mask = _mm512_permutexvar_epi16(half, ld(HMASK.as_ptr().cast()));
         let hprefix = _mm512_permutexvar_epi16(half, ld(HPREFIX.as_ptr().cast()));
         let bit = _mm512_sllv_epi16(w(1), _mm512_and_si512(_mm512_srli_epi16::<5>(cp), w(15)));
-        if _mm512_test_epi16_mask(mask, bit) != u32::MAX {
-            return false;
+        let valid = lead_ok & _mm512_test_epi16_mask(mask, bit);
+        // 8-character groups before the first rejected lane. With none, skip
+        // the rest of the work (common when 2-byte characters are dense).
+        let groups = (valid.trailing_ones() / 8) as usize;
+        if groups == 0 {
+            return 0;
         }
         let rank = _mm512_popcnt_epi16(_mm512_and_si512(mask, _mm512_sub_epi16(bit, w(1))));
         let blocks = _mm512_add_epi16(
@@ -578,9 +585,16 @@ mod simd {
         let out = _mm512_permutexvar_epi8(ld(PACK.as_ptr()), words);
         #[cfg(test)]
         AVX512_BLOCKS.with(|n| n.set(n.get() + 1));
-        // SAFETY: the caller guarantees 60 writable bytes at `d`.
-        unsafe { _mm512_mask_storeu_epi8(d.cast(), (1 << 60) - 1, out) };
-        true
+
+        if groups == 4 {
+            // SAFETY: the caller guarantees 60 writable bytes at `d`.
+            unsafe { _mm512_mask_storeu_epi8(d.cast(), (1 << 60) - 1, out) };
+            return 4;
+        }
+        core::hint::cold_path();
+        // SAFETY: as above; at most 45 bytes are written.
+        unsafe { _mm512_mask_storeu_epi8(d.cast(), (1u64 << (15 * groups)) - 1, out) };
+        groups
     }
 
     #[cfg(all(test, target_arch = "x86_64"))]
