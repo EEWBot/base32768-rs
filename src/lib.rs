@@ -357,7 +357,7 @@ unsafe fn decode_fast_dispatch<const USE_SIMD: bool>(
         return unsafe { decode_fast_ssse3(bytes, dst) };
     }
 
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
     if USE_SIMD {
         // SAFETY: NEON is part of the aarch64 baseline.
         return unsafe { decode_fast::<true>(bytes, dst) };
@@ -444,7 +444,9 @@ mod simd {
         Some(out)
     }
 
-    #[cfg(target_arch = "aarch64")]
+    // The `tbl` indices place each byte in the low half of a u16 lane, which
+    // assumes little-endian lanes.
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
     #[target_feature(enable = "neon")]
     #[inline]
     pub unsafe fn code_points_8x3(p: *const u8) -> Option<[u16; 8]> {
@@ -497,7 +499,10 @@ mod simd {
     }
 
     /// Never called: `SIMD` is only enabled on the architectures above.
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    #[cfg(not(any(
+        target_arch = "x86_64",
+        all(target_arch = "aarch64", target_endian = "little")
+    )))]
     #[inline(always)]
     pub unsafe fn code_points_8x3(_p: *const u8) -> Option<[u16; 8]> {
         None
