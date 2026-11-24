@@ -488,57 +488,46 @@ mod simd {
         Some(out)
     }
 
-    // The `tbl` indices place each byte in the low half of a u16 lane, which
-    // assumes little-endian lanes.
+    // `vzip` of the low and high bytes builds u16 lanes, which assumes
+    // little-endian lanes.
     #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
     #[target_feature(enable = "neon")]
     #[inline]
     pub unsafe fn code_points_8x3(p: *const u8) -> Option<[u16; 8]> {
         use core::arch::aarch64::*;
 
-        /// `tbl` indices gathering byte `K` of each character into the low byte
-        /// of a u16 lane. The table is bytes 0..16 followed by bytes 8..24, so
-        /// offsets 16..24 are read from the second half; 0xFF yields zero.
-        const fn indices<const K: usize>() -> [u8; 16] {
-            let mut idx = [0xFF; 16];
-            let mut i = 0;
-            while i < 8 {
-                let off = 3 * i + K;
-                idx[2 * i] = if off < 16 { off as u8 } else { (off + 8) as u8 };
-                i += 1;
-            }
-            idx
+        // One `ld3` reads the 24 bytes without overlap and de-interleaves them:
+        // `b0`, `b1`, `b2` hold byte 0, 1, 2 of each character. Written as
+        // `asm!` because LLVM splits the `vld3_u8` intrinsic into plain loads
+        // plus per-lane moves here (it merges them with the loads of the
+        // fallback path), which is far slower than `ld3`.
+        let (b0, b1, b2): (uint8x8_t, uint8x8_t, uint8x8_t);
+        // SAFETY: the caller guarantees `p .. p + 24` is readable, and `ld3`
+        // with three 8-byte registers reads exactly those 24 bytes.
+        unsafe {
+            core::arch::asm!(
+                "ld3 {{v0.8b, v1.8b, v2.8b}}, [{p}]",
+                p = in(reg) p,
+                out("v0") b0,
+                out("v1") b1,
+                out("v2") b2,
+                options(pure, readonly, nostack, preserves_flags),
+            );
         }
-        const I0: [u8; 16] = indices::<0>();
-        const I1: [u8; 16] = indices::<1>();
-        const I2: [u8; 16] = indices::<2>();
 
-        // SAFETY: the caller guarantees `p .. p + 24` is readable.
-        let table = unsafe { uint8x16x2_t(vld1q_u8(p), vld1q_u8(p.add(8))) };
-        // SAFETY: the index arrays are 16 bytes.
-        let gather = |idx: &[u8; 16]| unsafe {
-            vreinterpretq_u16_u8(vqtbl2q_u8(table, vld1q_u8(idx.as_ptr())))
-        };
-
-        let b0 = gather(&I0);
-        let is_3byte = vceqq_u16(vandq_u16(b0, vdupq_n_u16(0xF0)), vdupq_n_u16(0xE0));
-        if vminvq_u16(is_3byte) == 0 {
+        let is_3byte = vceq_u8(vand_u8(b0, vdup_n_u8(0xF0)), vdup_n_u8(0xE0));
+        if vminv_u8(is_3byte) == 0 {
             return None;
         }
-        let b1 = gather(&I1);
-        let b2 = gather(&I2);
 
-        let cp = vorrq_u16(
-            vorrq_u16(
-                vshlq_n_u16::<12>(vandq_u16(b0, vdupq_n_u16(0x0F))),
-                vshlq_n_u16::<6>(vandq_u16(b1, vdupq_n_u16(0x3F))),
-            ),
-            vandq_u16(b2, vdupq_n_u16(0x3F)),
-        );
+        // 1110aaaa 10bbbbbb 10cccccc -> high byte aaaabbbb, low byte bbcccccc.
+        let hi = vsli_n_u8::<4>(vshr_n_u8::<2>(b1), b0);
+        let lo = vsli_n_u8::<6>(b2, b1);
+        let cp = vcombine_u8(vzip1_u8(lo, hi), vzip2_u8(lo, hi));
 
         let mut out = [0u16; 8];
         // SAFETY: `out` is 16 bytes.
-        unsafe { vst1q_u16(out.as_mut_ptr(), cp) };
+        unsafe { vst1q_u8(out.as_mut_ptr().cast(), cp) };
         Some(out)
     }
 
