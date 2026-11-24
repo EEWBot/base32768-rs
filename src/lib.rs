@@ -230,6 +230,14 @@ pub fn decode(s: &str) -> Result<Vec<u8>, DecodeError> {
 #[cfg_attr(not(test), allow(dead_code))]
 const LEVEL_SCALAR: u8 = 0;
 /// SSSE3 on x86-64, NEON on little-endian aarch64.
+#[cfg_attr(
+    not(any(
+        test,
+        target_arch = "x86_64",
+        all(target_arch = "aarch64", target_endian = "little")
+    )),
+    allow(dead_code)
+)]
 const LEVEL_SIMD: u8 = 1;
 /// AVX-512 (BW, VBMI, BITALG) on x86-64.
 const LEVEL_AVX512: u8 = 2;
@@ -569,17 +577,19 @@ mod simd {
         );
         let out = _mm512_permutexvar_epi8(ld(PACK.as_ptr()), words);
         #[cfg(test)]
-        AVX512_BLOCKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        AVX512_BLOCKS.with(|n| n.set(n.get() + 1));
         // SAFETY: the caller guarantees 60 writable bytes at `d`.
         unsafe { _mm512_mask_storeu_epi8(d.cast(), (1 << 60) - 1, out) };
         true
     }
 
-    /// Number of 32-character blocks the AVX-512 path decoded, so tests can
-    /// check that it ran.
     #[cfg(all(test, target_arch = "x86_64"))]
-    pub static AVX512_BLOCKS: core::sync::atomic::AtomicUsize =
-        core::sync::atomic::AtomicUsize::new(0);
+    thread_local! {
+        /// Number of 32-character blocks the AVX-512 path decoded on this
+        /// thread. Thread-local because tests run in parallel threads: a test
+        /// sees only its own calls.
+        pub static AVX512_BLOCKS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+    }
 
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "ssse3")]
@@ -821,10 +831,12 @@ mod tests {
         }
     }
 
-    /// Every 15-bit value (2- and 3-byte characters) at every byte alignment,
-    /// so each value passes through every position of the fast-path blocks.
+    /// Every 15-bit value (2- and 3-byte characters) with the input bit
+    /// stream shifted by 0..15 leading bytes, which changes where each value's
+    /// bits fall within the encoded 15-bit groups. (Memory addresses and SIMD
+    /// lanes are covered by the tests below.)
     #[test]
-    fn every_value_every_alignment() {
+    fn every_value_every_bit_offset() {
         let mut all = vec![0u8; 32768 * 15 / 8];
         for z in 0..32768usize {
             for k in 0..15 {
@@ -872,7 +884,6 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn avx512_path_runs() {
-        use std::sync::atomic::Ordering::Relaxed;
         if !(std::is_x86_feature_detected!("avx512bw")
             && std::is_x86_feature_detected!("avx512vbmi")
             && std::is_x86_feature_detected!("avx512bitalg"))
@@ -882,9 +893,233 @@ mod tests {
         }
         let data: Vec<u8> = (0..3000).map(|i| (i * 7) as u8).collect();
         let encoded = crate::encode(&data);
-        let before = crate::simd::AVX512_BLOCKS.load(Relaxed);
+        let blocks = || crate::simd::AVX512_BLOCKS.with(|n| n.get());
+        let before = blocks();
         assert_eq!(decode_impl::<LEVEL_AVX512>(&encoded).unwrap(), data);
-        assert!(crate::simd::AVX512_BLOCKS.load(Relaxed) > before);
+        assert!(blocks() > before);
+    }
+
+    /// Pseudo-random bytes (xorshift64).
+    fn random_bytes(n: usize, mut state: u64) -> Vec<u8> {
+        (0..n)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 56) as u8
+            })
+            .collect()
+    }
+
+    /// All 3-byte UTF-8 characters that encode a 15-bit value.
+    fn three_byte_z15_chars() -> Vec<char> {
+        (0x800..=0xFFFFu32)
+            .filter(|&cp| crate::table::DECODE[cp as usize] < 0x8000)
+            .map(|cp| char::from_u32(cp).unwrap())
+            .collect()
+    }
+
+    /// The input starting at every offset 0..64 from an allocation, so the
+    /// SIMD loads see every address alignment up to 64 bytes.
+    #[test]
+    fn input_address_offsets() {
+        let data = random_bytes(1000, 0x2545_F491_4F6C_DD1D);
+        let encoded = crate::encode(&data);
+        for offset in 0..64 {
+            let mut buf = "x".repeat(offset);
+            buf.push_str(&encoded);
+            assert_eq!(
+                decode_every_level(&buf[offset..]).unwrap(),
+                data,
+                "{offset}"
+            );
+        }
+    }
+
+    /// Every 3-byte 15-bit character in every lane of the 8- and 32-character
+    /// SIMD blocks: the characters are decoded in sequence, preceded by 0..32
+    /// filler characters, so character i lands in lane (i + shift) % 32.
+    #[test]
+    fn every_3byte_char_in_every_lane() {
+        let chars = three_byte_z15_chars();
+        let filler = chars[0];
+        for shift in 0..32 {
+            let mut s: String = std::iter::repeat_n(filler, shift).collect();
+            s.extend(&chars);
+            // A multiple of 8 characters is a whole number of bytes with no padding.
+            let n = shift + chars.len();
+            s.extend(std::iter::repeat_n(filler, n.next_multiple_of(8) - n));
+            let decoded = decode_every_level(&s).unwrap();
+            assert_eq!(crate::encode(&decoded), s, "shift {shift}");
+        }
+    }
+
+    /// Every 3-byte code point outside the repertoire, in lane cp % 32 of an
+    /// otherwise valid 64-character input.
+    #[test]
+    fn every_invalid_3byte_code_point() {
+        let valid: Vec<char> = crate::encode(&random_bytes(120, 7)).chars().collect();
+        assert_eq!(valid.len(), 64);
+        for cp in 0x800..=0xFFFFu32 {
+            let Some(c) = char::from_u32(cp) else {
+                continue; // surrogates
+            };
+            if crate::table::DECODE[cp as usize] < 0x8000 {
+                continue;
+            }
+            let mut chars = valid.clone();
+            chars[cp as usize % 32] = c;
+            let s: String = chars.into_iter().collect();
+            assert!(
+                matches!(
+                    decode_every_level(&s),
+                    Err(DecodeError::UnrecognizedCharacter(e)) if e == c
+                ),
+                "U+{cp:04X}"
+            );
+        }
+    }
+
+    /// The page + rank tables used by the AVX-512 path, evaluated in scalar
+    /// code, agree with `DECODE` for every code point U+0000..=U+FFFF.
+    #[test]
+    fn rank_tables_match_decode_table() {
+        use crate::table::{DECODE, HALF_MASK, HALF_PREFIX, PAGE_DESC};
+        for cp in 0..=0xFFFFu32 {
+            let desc = PAGE_DESC[cp as usize >> 10] as u32;
+            let half = ((desc | (cp >> 9 & 1)) & 31) as usize;
+            let mask = HALF_MASK[half] as u32;
+            let bit = 1 << (cp >> 5 & 15);
+            let expected = DECODE[cp as usize];
+            if mask & bit == 0 {
+                assert!(
+                    expected >= 0x8000,
+                    "U+{cp:04X} should be a 15-bit character"
+                );
+                continue;
+            }
+            let rank = (mask & (bit - 1)).count_ones();
+            let z = ((desc >> 5) + HALF_PREFIX[half] as u32 + rank) << 5 | (cp & 31);
+            assert_eq!(z, expected as u32, "U+{cp:04X}");
+        }
+    }
+
+    /// Inputs that end right before an inaccessible page: any read past the
+    /// end of the input faults.
+    #[cfg(any(windows, all(target_os = "linux", target_pointer_width = "64")))]
+    #[test]
+    fn reads_stay_within_input() {
+        // 64 KiB covers both the page size and Windows' allocation granularity.
+        const SIZE: usize = 1 << 16;
+        let base = unsafe { guard_page::alloc(2 * SIZE) };
+        assert!(!base.is_null());
+        assert!(unsafe { guard_page::protect_none(base.add(SIZE), SIZE) });
+        let end = unsafe { base.add(SIZE) };
+
+        let decode_at_end = |s: &str| {
+            // SAFETY: `s` fits in the accessible first half.
+            let copy = unsafe {
+                let dst = end.sub(s.len());
+                std::ptr::copy_nonoverlapping(s.as_ptr(), dst, s.len());
+                std::str::from_utf8_unchecked(std::slice::from_raw_parts(dst, s.len()))
+            };
+            decode_every_level(copy)
+        };
+
+        let random = random_bytes(600, 11);
+        // Zero bytes encode to 2-byte characters, which take the fallback paths.
+        let mixed: Vec<u8> = random
+            .iter()
+            .enumerate()
+            .map(|(i, &b)| if i % 23 < 4 { 0 } else { b })
+            .collect();
+        for data in [&random, &mixed] {
+            for n in 0..=data.len() {
+                let encoded = crate::encode(&data[..n]);
+                assert_eq!(decode_at_end(&encoded).unwrap(), &data[..n], "{n}");
+                let bad = format!("{encoded}\u{3000}");
+                assert!(decode_at_end(&bad).is_err(), "{n}");
+            }
+        }
+        unsafe { guard_page::free(base, 2 * SIZE) };
+    }
+
+    #[cfg(windows)]
+    mod guard_page {
+        use core::ffi::c_void;
+        unsafe extern "system" {
+            fn VirtualAlloc(addr: *mut c_void, size: usize, ty: u32, protect: u32) -> *mut c_void;
+            fn VirtualProtect(addr: *mut c_void, size: usize, protect: u32, old: *mut u32) -> i32;
+            fn VirtualFree(addr: *mut c_void, size: usize, ty: u32) -> i32;
+        }
+        const MEM_COMMIT_RESERVE: u32 = 0x3000;
+        const MEM_RELEASE: u32 = 0x8000;
+        const PAGE_NOACCESS: u32 = 0x01;
+        const PAGE_READWRITE: u32 = 0x04;
+
+        pub unsafe fn alloc(size: usize) -> *mut u8 {
+            unsafe {
+                VirtualAlloc(
+                    core::ptr::null_mut(),
+                    size,
+                    MEM_COMMIT_RESERVE,
+                    PAGE_READWRITE,
+                )
+                .cast()
+            }
+        }
+        pub unsafe fn protect_none(p: *mut u8, size: usize) -> bool {
+            let mut old = 0;
+            unsafe { VirtualProtect(p.cast(), size, PAGE_NOACCESS, &mut old) != 0 }
+        }
+        pub unsafe fn free(p: *mut u8, _size: usize) {
+            unsafe { VirtualFree(p.cast(), 0, MEM_RELEASE) };
+        }
+    }
+
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    mod guard_page {
+        use core::ffi::c_void;
+        unsafe extern "C" {
+            fn mmap(
+                addr: *mut c_void,
+                len: usize,
+                prot: i32,
+                flags: i32,
+                fd: i32,
+                off: i64,
+            ) -> *mut c_void;
+            fn mprotect(addr: *mut c_void, len: usize, prot: i32) -> i32;
+            fn munmap(addr: *mut c_void, len: usize) -> i32;
+        }
+        const PROT_NONE: i32 = 0;
+        const PROT_READ_WRITE: i32 = 3;
+        const MAP_PRIVATE_ANONYMOUS: i32 = 0x22;
+
+        pub unsafe fn alloc(size: usize) -> *mut u8 {
+            let p = unsafe {
+                mmap(
+                    core::ptr::null_mut(),
+                    size,
+                    PROT_READ_WRITE,
+                    MAP_PRIVATE_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            };
+            // MAP_FAILED is (void *)-1.
+            if p as usize == usize::MAX {
+                core::ptr::null_mut()
+            } else {
+                p.cast()
+            }
+        }
+        pub unsafe fn protect_none(p: *mut u8, size: usize) -> bool {
+            unsafe { mprotect(p.cast(), size, PROT_NONE) == 0 }
+        }
+        pub unsafe fn free(p: *mut u8, size: usize) {
+            unsafe { munmap(p.cast(), size) };
+        }
     }
 
     /// The capacity helpers must equal the exact formulas evaluated without

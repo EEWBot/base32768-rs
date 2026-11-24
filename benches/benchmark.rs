@@ -15,61 +15,29 @@ fn criterion_benchmark(c: &mut Criterion) {
             (state >> 56) as u8
         })
         .collect();
-    let one_byte_string = base32768::encode(&one_byte_array);
-    let ten_kilobytes_string = base32768::encode(&ten_kilobytes_array);
-    let one_megabytes_string = base32768::encode(&one_megabytes_array);
-    let random_one_megabyte_string = base32768::encode(&random_one_megabyte_array);
+    let datasets: [(&str, &[u8]); 4] = [
+        ("OneByte", &one_byte_array),
+        ("TenKilobytes", &ten_kilobytes_array),
+        ("OneMegabyte", &one_megabytes_array),
+        ("RandomOneMegabyte", &random_one_megabyte_array),
+    ];
 
     let mut group = c.benchmark_group("base32768");
-    group.throughput(criterion::Throughput::Elements(1));
-
-    group.bench_function("encoderOneByte", |b| {
-        b.iter(|| {
-            black_box(base32768::encode(black_box(&one_byte_array)));
-        })
-    });
-
-    group.bench_function("encoderTenKilobytes", |b| {
-        b.iter(|| {
-            black_box(base32768::encode(black_box(&ten_kilobytes_array)));
-        })
-    });
-
-    group.bench_function("encoderOneMegabyte", |b| {
-        b.iter(|| {
-            black_box(base32768::encode(black_box(&one_megabytes_array)));
-        })
-    });
-
-    group.bench_function("encoderRandomOneMegabyte", |b| {
-        b.iter(|| {
-            black_box(base32768::encode(black_box(&random_one_megabyte_array)));
-        })
-    });
-
-    group.bench_function("decoderOneByte", |b| {
-        b.iter(|| {
-            black_box(base32768::decode(black_box(&one_byte_string)).unwrap());
-        })
-    });
-
-    group.bench_function("decoderTenKilobytes", |b| {
-        b.iter(|| {
-            black_box(base32768::decode(black_box(&ten_kilobytes_string)).unwrap());
-        })
-    });
-
-    group.bench_function("decoderOneMegabyte", |b| {
-        b.iter(|| {
-            black_box(base32768::decode(black_box(&one_megabytes_string)).unwrap());
-        })
-    });
-
-    group.bench_function("decoderRandomOneMegabyte", |b| {
-        b.iter(|| {
-            black_box(base32768::decode(black_box(&random_one_megabyte_string)).unwrap());
-        })
-    });
+    // Throughput is the binary data size (the encoder's input, the decoder's
+    // output), so criterion reports encode and decode in comparable bytes/s.
+    for (name, data) in datasets {
+        group.throughput(criterion::Throughput::Bytes(data.len() as u64));
+        group.bench_function(format!("encoder{name}"), |b| {
+            b.iter(|| black_box(base32768::encode(black_box(data))))
+        });
+    }
+    for (name, data) in datasets {
+        let encoded = base32768::encode(data);
+        group.throughput(criterion::Throughput::Bytes(data.len() as u64));
+        group.bench_function(format!("decoder{name}"), |b| {
+            b.iter(|| black_box(base32768::decode(black_box(&encoded)).unwrap()))
+        });
+    }
 
     group.finish();
 }
