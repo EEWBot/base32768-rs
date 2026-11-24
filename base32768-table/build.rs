@@ -69,33 +69,28 @@ fn main() {
     assert_eq!(z15_blocks.len(), (1 << 15) / BLOCK_SIZE as usize);
     assert_eq!(z7_blocks.len(), (1 << 7) / BLOCK_SIZE as usize);
 
-    // Decode table indexed by `code_point >> 5`.
-    // 0xFFFF = not a Base32768 character, 0x8000 | z = 7-bit block, z = 15-bit block.
-    // Covers every code point of a 2 or 3 byte UTF-8 sequence (U+0000..=U+FFFF),
-    // so lookups need no bounds check.
-    let max_cp = z15_blocks.iter().chain(&z7_blocks).max().unwrap() + BLOCK_SIZE - 1;
-    assert!(max_cp <= 0xFFFF);
-    let mut decode = vec![0xFFFFu16; 0x10000 >> BLOCK_BITS];
-    for (i, &cp) in z15_blocks.iter().enumerate() {
-        decode[(cp >> BLOCK_BITS) as usize] = (i as u32 * BLOCK_SIZE) as u16;
+    // Decode table indexed by code point, covering every 2 or 3 byte UTF-8
+    // sequence (U+0000..=U+FFFF) so lookups need no bounds check.
+    // 0xFFFF = not a Base32768 character, 0x8000 | z = 7-bit, z = 15-bit.
+    let chars = |blocks: &[u32]| -> Vec<u32> {
+        blocks.iter().flat_map(|&cp| cp..cp + BLOCK_SIZE).collect()
+    };
+    let mut decode = vec![0xFFFFu16; 0x10000];
+    for (z, cp) in chars(&z15_blocks).into_iter().enumerate() {
+        decode[cp as usize] = z as u16;
     }
-    for (i, &cp) in z7_blocks.iter().enumerate() {
-        decode[(cp >> BLOCK_BITS) as usize] = 0x8000 | (i as u32 * BLOCK_SIZE) as u16;
+    for (z, cp) in chars(&z7_blocks).into_iter().enumerate() {
+        decode[cp as usize] = 0x8000 | z as u16;
     }
 
-    // Full per-value tables: one load per character instead of block + shift.
-    let expand = |blocks: &[u32]| -> Vec<u32> {
-        blocks
-            .iter()
-            .flat_map(|&cp| (cp..cp + BLOCK_SIZE).map(packed_utf8))
-            .collect()
-    };
+    // Encode tables: packed UTF-8 for every value.
+    let expand =
+        |blocks: &[u32]| -> Vec<u32> { chars(blocks).into_iter().map(packed_utf8).collect() };
     let z15_utf8 = expand(&z15_blocks);
     let z7_utf8 = expand(&z7_blocks);
 
+    // Large tables are emitted as `static` so each exists exactly once in the binary.
     let mut out = String::new();
-    writeln!(out, "pub const BLOCK_BITS: u32 = {BLOCK_BITS};").unwrap();
-    // `static` so the 128 KB table exists exactly once in the binary.
     write_array(
         &mut out,
         "/// Packed UTF-8 (`len << 24 | le_bytes`) of the character for each 15-bit value.",
@@ -112,8 +107,8 @@ fn main() {
     );
     write_array(
         &mut out,
-        "/// `code_point >> 5` -> 0xFFFF (invalid), `0x8000 | z` (7-bit) or `z` (15-bit), where z is the block's first value.",
-        "DECODE_BLOCK",
+        "/// Code point (U+0000..=U+FFFF) -> 0xFFFF (invalid), `0x8000 | z` (7-bit) or `z` (15-bit).",
+        "DECODE",
         "u16",
         &decode,
     );

@@ -14,11 +14,9 @@ pub enum DecodeError {
     PaddingMismatch,
 }
 
-const BLOCK_MASK: u32 = (1 << table::BLOCK_BITS) - 1;
-
-/// `table::DECODE_BLOCK` value for a code point that is not a Base32768 character.
+/// `table::DECODE` value for a code point that is not a Base32768 character.
 const INVALID: u32 = 0xFFFF;
-/// Set in `table::DECODE_BLOCK` values of 7-bit characters (and of `INVALID`).
+/// Set in `table::DECODE` values of 7-bit characters (and of `INVALID`).
 const FLAG7: u32 = 0x8000;
 
 // ---------------------------------------------------------------------------
@@ -124,11 +122,8 @@ pub fn encode(b: &[u8]) -> String {
 /// Returns `INVALID`, `FLAG7 | z` or `z`.
 #[inline(always)]
 fn lookup(cp: u32) -> u32 {
-    // The table spans all of U+0000..=U+FFFF, so the mask removes the bounds
-    // check. Block bases are multiples of 32, so OR-ing in the offset equals
-    // adding it, and INVALID (0xFFFF) stays INVALID.
-    let base = table::DECODE_BLOCK[(cp >> table::BLOCK_BITS) as usize & 0x7FF] as u32;
-    base | (cp & BLOCK_MASK)
+    // The table spans all of U+0000..=U+FFFF, so the mask removes the bounds check.
+    table::DECODE[cp as usize & 0xFFFF] as u32
 }
 
 /// Decodes a character known to be a 3 byte UTF-8 sequence.
