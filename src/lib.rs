@@ -51,6 +51,22 @@ unsafe fn put(dst: *mut u8, pos: usize, packed: u32) -> usize {
     pos + (packed >> 24) as usize
 }
 
+/// Returns `x` unchanged. When AVX-512 is enabled at compile time (e.g.
+/// `-C target-cpu=native` on Zen 4/5 or Sapphire Rapids), LLVM turns the eight
+/// table lookups in `encode` into a `vpgatherqd` plus `vpextrd` stores, which
+/// is 20-57% slower than plain loads. An empty `asm!` makes each value opaque,
+/// so it stays in a general-purpose register and the gather is never formed.
+/// Other targets compile exactly as without it.
+#[inline(always)]
+fn scalar_barrier(#[allow(unused_mut)] mut x: u32) -> u32 {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+    // SAFETY: an empty asm block with one register operand has no effect.
+    unsafe {
+        core::arch::asm!("/* {0:e} */", inout(reg) x, options(pure, nomem, nostack, preserves_flags));
+    }
+    x
+}
+
 pub fn encode(b: &[u8]) -> String {
     let num_chars = (b.len() * 8).div_ceil(15);
     // 3 bytes per character at most, plus 1 for the spare byte `put` writes.
@@ -65,15 +81,15 @@ pub fn encode(b: &[u8]) -> String {
         let lo = u64::from_be_bytes(chunk[7..15].try_into().unwrap());
 
         let c = [
-            z15_utf8((hi >> 49) as u32),
-            z15_utf8((hi >> 34) as u32 & 0x7FFF),
-            z15_utf8((hi >> 19) as u32 & 0x7FFF),
-            z15_utf8((hi >> 4) as u32 & 0x7FFF),
+            scalar_barrier(z15_utf8((hi >> 49) as u32)),
+            scalar_barrier(z15_utf8((hi >> 34) as u32 & 0x7FFF)),
+            scalar_barrier(z15_utf8((hi >> 19) as u32 & 0x7FFF)),
+            scalar_barrier(z15_utf8((hi >> 4) as u32 & 0x7FFF)),
             // `lo` starts at byte 7, so it already holds `hi`'s low 4 bits.
-            z15_utf8((lo >> 45) as u32 & 0x7FFF),
-            z15_utf8((lo >> 30) as u32 & 0x7FFF),
-            z15_utf8((lo >> 15) as u32 & 0x7FFF),
-            z15_utf8(lo as u32 & 0x7FFF),
+            scalar_barrier(z15_utf8((lo >> 45) as u32 & 0x7FFF)),
+            scalar_barrier(z15_utf8((lo >> 30) as u32 & 0x7FFF)),
+            scalar_barrier(z15_utf8((lo >> 15) as u32 & 0x7FFF)),
+            scalar_barrier(z15_utf8(lo as u32 & 0x7FFF)),
         ];
 
         // SAFETY: at most 8 * 3 + 1 bytes per chunk; covered by the capacity.
