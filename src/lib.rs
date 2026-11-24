@@ -67,10 +67,39 @@ fn scalar_barrier(#[allow(unused_mut)] mut x: u32) -> u32 {
     x
 }
 
+/// Number of characters `encode` produces for `len` input bytes:
+/// `ceil(len * 8 / 15)`, computed without overflowing `len * 8`.
+#[inline]
+fn encoded_chars(len: usize) -> usize {
+    len / 15 * 8 + (len % 15 * 8).div_ceil(15)
+}
+
+/// Output capacity `encode` needs: 3 bytes per character at most, plus 1 for
+/// the spare byte `put` writes.
+///
+/// # Panics
+/// If the size does not fit in `usize` (only possible on 32-bit or smaller
+/// targets). Wrapping here would under-allocate the buffer `encode` writes to
+/// through raw pointers.
+#[inline]
+fn encoded_capacity(len: usize) -> usize {
+    encoded_chars(len)
+        .checked_mul(3)
+        .and_then(|n| n.checked_add(1))
+        .expect("base32768: encoded output size overflows usize")
+}
+
+/// Output capacity `decode` needs for `len` bytes of input:
+/// `floor(len / 2 * 15 / 8) + 1`, computed without overflowing. Every character
+/// is at least 2 bytes and carries at most 15 bits; the result is below `len`.
+#[inline]
+fn decoded_capacity(len: usize) -> usize {
+    let chars = len / 2;
+    chars / 8 * 15 + chars % 8 * 15 / 8 + 1
+}
+
 pub fn encode(b: &[u8]) -> String {
-    let num_chars = (b.len() * 8).div_ceil(15);
-    // 3 bytes per character at most, plus 1 for the spare byte `put` writes.
-    let mut out: Vec<u8> = Vec::with_capacity(num_chars * 3 + 1);
+    let mut out: Vec<u8> = Vec::with_capacity(encoded_capacity(b.len()));
     let dst = out.as_mut_ptr();
     let mut pos = 0usize;
 
@@ -119,7 +148,7 @@ pub fn encode(b: &[u8]) -> String {
         bits += 8;
         if bits >= 15 {
             bits -= 15;
-            // SAFETY: still within the `num_chars` characters reserved.
+            // SAFETY: still within the `encoded_chars` characters reserved.
             pos = unsafe { put(dst, pos, z15_utf8((acc >> bits) as u32 & 0x7FFF)) };
             acc &= (1 << bits) - 1;
         }
@@ -134,7 +163,7 @@ pub fn encode(b: &[u8]) -> String {
             let pad = 15 - bits;
             z15_utf8(((acc << pad) | ((1 << pad) - 1)) as u32)
         };
-        // SAFETY: this is the last of the `num_chars` characters reserved.
+        // SAFETY: this is the last of the `encoded_chars` characters reserved.
         pos = unsafe { put(dst, pos, packed) };
     }
 
@@ -200,8 +229,7 @@ pub fn decode(s: &str) -> Result<Vec<u8>, DecodeError> {
 fn decode_impl<const USE_SIMD: bool>(s: &str) -> Result<Vec<u8>, DecodeError> {
     let bytes = s.as_bytes();
     let len = bytes.len();
-    // Every character is at least 2 bytes and carries at most 15 bits.
-    let mut out: Vec<u8> = Vec::with_capacity(len / 2 * 15 / 8 + 1);
+    let mut out: Vec<u8> = Vec::with_capacity(decoded_capacity(len));
 
     let mut pos = 0usize;
     let mut char_index = 0usize;
@@ -318,7 +346,7 @@ unsafe fn read_8<const SIMD: bool>(p: *const u8) -> ([u32; 8], usize) {
 /// Returns `(bytes consumed, bytes written, characters consumed)`.
 ///
 /// # Safety
-/// `dst` must have room for `bytes.len() / 2 * 15 / 8` bytes; with `SIMD`, see
+/// `dst` must have room for `decoded_capacity(bytes.len()) - 1` bytes; with `SIMD`, see
 /// [`read_8`].
 #[inline(always)]
 unsafe fn decode_fast<const SIMD: bool>(bytes: &[u8], dst: *mut u8) -> (usize, usize, usize) {
@@ -340,7 +368,7 @@ unsafe fn decode_fast<const SIMD: bool>(bytes: &[u8], dst: *mut u8) -> (usize, u
         let w1 = (v3 << 60) | (v4 << 45) | (v5 << 30) | (v6 << 15) | v7;
 
         // SAFETY: 16 input bytes or more were consumed for these 15 output
-        // bytes, so `written + 15 <= len / 2 * 15 / 8`.
+        // bytes, so `written + 15 < decoded_capacity(len)`.
         unsafe {
             let d = dst.add(written);
             d.cast::<[u8; 8]>().write_unaligned(w0.to_be_bytes());
@@ -620,6 +648,46 @@ mod tests {
                     "{i}"
                 );
             }
+        }
+    }
+
+    /// The capacity helpers must equal the exact formulas evaluated without
+    /// overflow, for every `usize` including lengths where `len * 8` or
+    /// `len / 2 * 15` would wrap (>= 512 MiB on 32-bit targets).
+    #[test]
+    fn capacity_no_overflow() {
+        let max = usize::MAX;
+        let mut lens: Vec<usize> = (0..1000).collect();
+        for k in [8usize, 15, 16] {
+            let edge = max / k;
+            lens.extend(edge.saturating_sub(40)..=edge.saturating_add(40));
+        }
+        lens.extend(max - 40..=max);
+        lens.extend([1 << 29, (1 << 29) + 1, 1 << 31, isize::MAX as usize]);
+
+        for len in lens {
+            let l = len as u128;
+            let chars = (l * 8).div_ceil(15);
+            assert_eq!(
+                crate::encoded_chars(len) as u128,
+                chars,
+                "encoded_chars({len})"
+            );
+            let enc = chars * 3 + 1;
+            if enc <= max as u128 {
+                assert_eq!(
+                    crate::encoded_capacity(len) as u128,
+                    enc,
+                    "encoded_capacity({len})"
+                );
+            } else {
+                assert!(std::panic::catch_unwind(|| crate::encoded_capacity(len)).is_err());
+            }
+            assert_eq!(
+                crate::decoded_capacity(len) as u128,
+                l / 2 * 15 / 8 + 1,
+                "decoded_capacity({len})"
+            );
         }
     }
 }
