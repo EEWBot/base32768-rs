@@ -99,12 +99,44 @@ fn decoded_capacity(len: usize) -> usize {
 }
 
 pub fn encode(b: &[u8]) -> String {
+    encode_impl::<LEVEL_AVX512>(b)
+}
+
+/// Encodes with fast paths up to `LEVEL` (see [`LEVEL_SCALAR`]). Only
+/// `LEVEL_AVX512` adds one; below it the scalar path is used.
+fn encode_impl<const LEVEL: u8>(b: &[u8]) -> String {
     let mut out: Vec<u8> = Vec::with_capacity(encoded_capacity(b.len()));
     let dst = out.as_mut_ptr();
+    #[allow(unused_mut)]
     let mut pos = 0usize;
+    #[allow(unused_mut)]
+    let mut done = 0usize;
+
+    // AVX-512: 60 bytes -> 32 characters.
+    #[cfg(target_arch = "x86_64")]
+    if LEVEL >= LEVEL_AVX512
+        && std::is_x86_feature_detected!("avx512bw")
+        && std::is_x86_feature_detected!("avx512vbmi")
+        && std::is_x86_feature_detected!("avx512vbmi2")
+    {
+        #[target_feature(enable = "avx512f,avx512bw,avx512vbmi,avx512vbmi2")]
+        unsafe fn encode_avx512(b: &[u8], dst: *mut u8) -> (usize, usize) {
+            let (mut done, mut pos) = (0, 0);
+            while done + 60 <= b.len() {
+                // SAFETY: 60 bytes are readable at `done`. 60 input bytes
+                // reserve 32 * 3 = 96 output bytes, the most that is written.
+                pos += unsafe { simd::encode32_avx512(b.as_ptr().add(done), dst.add(pos)) };
+                done += 60;
+            }
+            (done, pos)
+        }
+        // SAFETY: the AVX-512 features were just checked; see above for the
+        // buffer sizes.
+        (done, pos) = unsafe { encode_avx512(b, dst) };
+    }
 
     // Fast path: 15 bytes -> 8 characters.
-    let (chunks, remainder) = b.as_chunks::<15>();
+    let (chunks, remainder) = b[done..].as_chunks::<15>();
     for chunk in chunks {
         let hi = u64::from_be_bytes(chunk[0..8].try_into().unwrap());
         let lo = u64::from_be_bytes(chunk[7..15].try_into().unwrap());
@@ -468,6 +500,152 @@ unsafe fn decode_fast_dispatch<const LEVEL: u8>(
 /// Code points of eight 3-byte UTF-8 characters at `p .. p + 24`, or `None` if
 /// any of the eight lead bytes is not a 3-byte lead (0xE0..=0xEF).
 mod simd {
+    /// Encodes the 60 bytes at `src` as 32 characters at `d`, without table
+    /// lookups, and returns the number of bytes written (64..=96). Writes
+    /// nothing past them.
+    ///
+    /// The top 5 bits of a 15-bit value z select one of 32 groups of 32
+    /// blocks (32 code points each). Block b of group g starts at code point
+    /// `((ENCODE_DESC[g] >> 3) + b + delta) << 5`, where `delta`, the number
+    /// of blocks skipped so far in the group, is
+    /// `ENCODE_DELTA[(ENCODE_DESC[g] & 7) << 5 | b]`.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx512f,avx512bw,avx512vbmi,avx512vbmi2")]
+    #[inline]
+    pub unsafe fn encode32_avx512(src: *const u8, d: *mut u8) -> usize {
+        use crate::table;
+        use core::arch::x86_64::*;
+
+        /// vpermb indices: lane i = input bytes (j, j+1) or (j+1, j+2) as a
+        /// big-endian u16, where j = 15 * i / 8.
+        const fn unpack_idx(second: bool) -> [u8; 64] {
+            let mut m = [0u8; 64];
+            let mut i = 0;
+            while i < 32 {
+                let j = 15 * i / 8 + second as usize;
+                m[2 * i] = (j + 1) as u8;
+                m[2 * i + 1] = j as u8;
+                i += 1;
+            }
+            m
+        }
+        /// Shifts that line up value i (starting at bit 15 * i) in those u16s.
+        const fn unpack_shift(right: bool) -> [u16; 32] {
+            let mut m = [0u16; 32];
+            let mut i = 0;
+            while i < 32 {
+                let o = (15 * i % 8) as u16;
+                m[i] = if right { 8 - o } else { o };
+                i += 1;
+            }
+            m
+        }
+        /// vpermt2b indices interleaving (b0, b1) from the first table and b2
+        /// from the second into 3 bytes per character, for characters
+        /// 16 * half .. 16 * half + 16.
+        const fn utf8_idx(half: usize) -> [u8; 64] {
+            let mut m = [0u8; 64];
+            let mut t = 0;
+            while t < 48 {
+                let k = 16 * half + t / 3;
+                m[t] = match t % 3 {
+                    0 => 2 * k,
+                    1 => 2 * k + 1,
+                    _ => 64 + 2 * k,
+                } as u8;
+                t += 1;
+            }
+            m
+        }
+        static IDX_A: [u8; 64] = unpack_idx(false);
+        static IDX_B: [u8; 64] = unpack_idx(true);
+        static SHL: [u16; 32] = unpack_shift(false);
+        static SHR: [u16; 32] = unpack_shift(true);
+        static OUT0: [u8; 64] = utf8_idx(0);
+        static OUT1: [u8; 64] = utf8_idx(1);
+        static DESC: [u16; 32] = table::ENCODE_DESC;
+        static DELTA: [u8; 256] = table::ENCODE_DELTA;
+        // SAFETY: each load reads 64 bytes from a table at least that long.
+        let ld = |p: *const u8| unsafe { _mm512_loadu_si512(p.cast()) };
+        let w = |x: i16| _mm512_set1_epi16(x);
+        const EVEN: u64 = 0x5555_5555_5555_5555;
+        const M48: u64 = (1 << 48) - 1;
+
+        // 60 bytes -> 32 x 15-bit values. The masked load touches only 60 bytes.
+        // SAFETY: the caller guarantees 60 readable bytes at `src`.
+        let v = unsafe { _mm512_maskz_loadu_epi8((1 << 60) - 1, src.cast()) };
+        let x = _mm512_permutexvar_epi8(ld(IDX_A.as_ptr()), v);
+        let y = _mm512_permutexvar_epi8(ld(IDX_B.as_ptr()), v);
+        let z = _mm512_srli_epi16::<1>(_mm512_or_si512(
+            _mm512_sllv_epi16(x, ld(SHL.as_ptr().cast())),
+            _mm512_srlv_epi16(y, ld(SHR.as_ptr().cast())),
+        ));
+
+        // z -> code point.
+        let desc = _mm512_permutexvar_epi16(_mm512_srli_epi16::<10>(z), ld(DESC.as_ptr().cast()));
+        let block = _mm512_and_si512(_mm512_srli_epi16::<5>(z), w(31));
+        let idx = _mm512_or_si512(_mm512_slli_epi16::<5>(_mm512_and_si512(desc, w(7))), block);
+        // Byte lookups in the 256-byte delta table: one per 128-byte half,
+        // picked by bit 7 of the index. The odd (high) bytes are zeroed.
+        let d_lo =
+            _mm512_maskz_permutex2var_epi8(EVEN, ld(DELTA.as_ptr()), idx, ld(DELTA[64..].as_ptr()));
+        let d_hi = _mm512_maskz_permutex2var_epi8(
+            EVEN,
+            ld(DELTA[128..].as_ptr()),
+            idx,
+            ld(DELTA[192..].as_ptr()),
+        );
+        let delta = _mm512_mask_blend_epi16(_mm512_cmpge_epu16_mask(idx, w(128)), d_lo, d_hi);
+        let cp_block =
+            _mm512_add_epi16(_mm512_add_epi16(_mm512_srli_epi16::<3>(desc), block), delta);
+        let cp = _mm512_or_si512(_mm512_slli_epi16::<5>(cp_block), _mm512_and_si512(z, w(31)));
+
+        // UTF-8 as 3 bytes per character; 2-byte characters get a leading 0,
+        // the only zero byte (every other byte has its top bit set).
+        let two = _mm512_cmplt_epu16_mask(cp, w(0x800));
+        let b0 =
+            _mm512_maskz_mov_epi16(!two, _mm512_or_si512(_mm512_srli_epi16::<12>(cp), w(0xE0)));
+        let b1 = _mm512_or_si512(
+            _mm512_and_si512(_mm512_srli_epi16::<6>(cp), w(0x3F)),
+            _mm512_mask_blend_epi16(two, w(0x80), w(0xC0)),
+        );
+        let b2 = _mm512_or_si512(_mm512_and_si512(cp, w(0x3F)), w(0x80));
+        let pair = _mm512_or_si512(b0, _mm512_slli_epi16::<8>(b1));
+        let out0 = _mm512_permutex2var_epi8(pair, ld(OUT0.as_ptr()), b2);
+        let out1 = _mm512_permutex2var_epi8(pair, ld(OUT1.as_ptr()), b2);
+
+        #[cfg(test)]
+        AVX512_ENCODE_BLOCKS.with(|n| n.set(n.get() + 1));
+
+        // SAFETY (stores below): the caller guarantees 96 writable bytes at
+        // `d`; each half writes at most 48, right after the previous one.
+        if two == 0 {
+            unsafe {
+                _mm512_mask_storeu_epi8(d.cast(), M48, out0);
+                _mm512_mask_storeu_epi8(d.add(48).cast(), M48, out1);
+            }
+            return 96;
+        }
+        core::hint::cold_path();
+        // Squeeze out the zero bytes, but only in a 16-character half that has
+        // a 2-byte character: vpcompressb is slow.
+        let half = |out: __m512i, has_two: bool| -> (usize, __m512i) {
+            if has_two {
+                let m = _mm512_test_epi8_mask(out, out) & M48;
+                (m.count_ones() as usize, _mm512_maskz_compress_epi8(m, out))
+            } else {
+                (48, out)
+            }
+        };
+        let (n0, c0) = half(out0, two & 0xFFFF != 0);
+        let (n1, c1) = half(out1, two >> 16 != 0);
+        unsafe {
+            _mm512_mask_storeu_epi8(d.cast(), (1 << n0) - 1, c0);
+            _mm512_mask_storeu_epi8(d.add(n0).cast(), (1 << n1) - 1, c1);
+        }
+        n0 + n1
+    }
+
     /// Decodes up to 32 three-byte 15-bit characters at `p .. p + 96`.
     /// Returns how many leading 8-character groups (0..=4) hold only 3-byte
     /// 15-bit characters; those groups are written to `d` as 15 bytes each,
@@ -603,6 +781,8 @@ mod simd {
         /// thread. Thread-local because tests run in parallel threads: a test
         /// sees only its own calls.
         pub static AVX512_BLOCKS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+        /// Number of 60-byte blocks the AVX-512 path encoded on this thread.
+        pub static AVX512_ENCODE_BLOCKS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -736,7 +916,14 @@ mod simd {
 
 #[cfg(test)]
 mod tests {
-    use crate::{DecodeError, LEVEL_AVX512, LEVEL_SCALAR, LEVEL_SIMD, decode_impl};
+    use crate::{DecodeError, LEVEL_AVX512, LEVEL_SCALAR, LEVEL_SIMD, decode_impl, encode_impl};
+
+    /// Encodes with every fast path level, checking that they all agree.
+    fn encode_every_level(b: &[u8]) -> String {
+        let scalar = encode_impl::<LEVEL_SCALAR>(b);
+        assert_eq!(encode_impl::<LEVEL_AVX512>(b), scalar, "AVX-512");
+        scalar
+    }
 
     /// Decodes with every fast path level, checking that they all agree.
     fn decode_every_level(s: &str) -> Result<Vec<u8>, DecodeError> {
@@ -771,7 +958,7 @@ mod tests {
             .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
             .collect();
         for n in 0..data.len() {
-            let encoded = crate::encode(&data[..n]);
+            let encoded = encode_every_level(&data[..n]);
             assert_eq!(
                 decode_every_level(&encoded).unwrap(),
                 &data[..n],
@@ -799,7 +986,7 @@ mod tests {
                     }
                 })
                 .collect();
-            let encoded = crate::encode(&data);
+            let encoded = encode_every_level(&data);
             assert_eq!(decode_every_level(&encoded).unwrap(), data, "round {round}");
         }
     }
@@ -814,7 +1001,7 @@ mod tests {
         }
 
         // Errors inside what would otherwise be a fast-path block.
-        let valid = crate::encode(&[0x55; 60]); // 32 chars
+        let valid = encode_every_level(&[0x55; 60]); // 32 chars
         let chars: Vec<char> = valid.chars().collect();
         for i in 0..chars.len() {
             let mut c = chars.clone();
@@ -863,7 +1050,7 @@ mod tests {
         for shift in 0..15 {
             let mut data = vec![0xA5u8; shift];
             data.extend_from_slice(&all);
-            let encoded = crate::encode(&data);
+            let encoded = encode_every_level(&data);
             assert_eq!(decode_every_level(&encoded).unwrap(), data, "shift {shift}");
         }
     }
@@ -881,7 +1068,7 @@ mod tests {
                 (state >> 56) as u8
             })
             .collect();
-        let valid = crate::encode(&data);
+        let valid = encode_every_level(&data);
         for (i, c) in valid.char_indices() {
             let s = format!("{}\u{3000}{}", &valid[..i], &valid[i + c.len_utf8()..]);
             assert!(
@@ -906,11 +1093,69 @@ mod tests {
             return;
         }
         let data: Vec<u8> = (0..3000).map(|i| (i * 7) as u8).collect();
-        let encoded = crate::encode(&data);
+        let encoded = encode_every_level(&data);
         let blocks = || crate::simd::AVX512_BLOCKS.with(|n| n.get());
         let before = blocks();
         assert_eq!(decode_impl::<LEVEL_AVX512>(&encoded).unwrap(), data);
         assert!(blocks() > before);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx512_encode_path_runs() {
+        if !(std::is_x86_feature_detected!("avx512bw")
+            && std::is_x86_feature_detected!("avx512vbmi")
+            && std::is_x86_feature_detected!("avx512vbmi2"))
+        {
+            eprintln!("AVX-512 BW/VBMI/VBMI2 not available; skipped");
+            return;
+        }
+        let data: Vec<u8> = (0..3000).map(|i| (i * 7) as u8).collect();
+        let blocks = || crate::simd::AVX512_ENCODE_BLOCKS.with(|n| n.get());
+        let before = blocks();
+        let encoded = encode_impl::<LEVEL_AVX512>(&data);
+        assert_eq!(blocks() - before, 3000 / 60);
+        assert_eq!(encoded, encode_impl::<LEVEL_SCALAR>(&data));
+    }
+
+    /// Packs 15-bit values into bytes, most significant bit first.
+    fn pack_z15(values: &[u16]) -> Vec<u8> {
+        let mut out = vec![0u8; (values.len() * 15).div_ceil(8)];
+        for (i, &z) in values.iter().enumerate() {
+            for k in 0..15 {
+                if z >> (14 - k) & 1 == 1 {
+                    let bit = i * 15 + k;
+                    out[bit / 8] |= 0x80 >> (bit % 8);
+                }
+            }
+        }
+        out
+    }
+
+    /// Every 15-bit value in every lane of the 32-character encode block,
+    /// and a 2-byte character (z < 224) at every position of a block of
+    /// 3-byte characters, alone or next to a second one.
+    #[test]
+    fn encode_every_value_every_lane() {
+        for lane in 0..32u16 {
+            let values: Vec<u16> = (0..lane).map(|i| 0x7FFF - i).chain(0..32768).collect();
+            let data = pack_z15(&values);
+            let encoded = encode_every_level(&data);
+            assert_eq!(decode_every_level(&encoded).unwrap(), data, "lane {lane}");
+        }
+        let three: Vec<u16> = (0..64).map(|i| 1000 + 97 * i).collect();
+        for i in 0..64 {
+            for j in [None, Some((i + 1) % 64), Some((i + 17) % 64)] {
+                let mut values = three.clone();
+                values[i] = i as u16;
+                if let Some(j) = j {
+                    values[j] = 223;
+                }
+                let data = pack_z15(&values);
+                let encoded = encode_every_level(&data);
+                assert_eq!(decode_every_level(&encoded).unwrap(), data, "{i} {j:?}");
+            }
+        }
     }
 
     /// Pseudo-random bytes (xorshift64).
@@ -938,7 +1183,7 @@ mod tests {
     #[test]
     fn input_address_offsets() {
         let data = random_bytes(1000, 0x2545_F491_4F6C_DD1D);
-        let encoded = crate::encode(&data);
+        let encoded = encode_every_level(&data);
         for offset in 0..64 {
             let mut buf = "x".repeat(offset);
             buf.push_str(&encoded);
@@ -964,7 +1209,7 @@ mod tests {
             let n = shift + chars.len();
             s.extend(std::iter::repeat_n(filler, n.next_multiple_of(8) - n));
             let decoded = decode_every_level(&s).unwrap();
-            assert_eq!(crate::encode(&decoded), s, "shift {shift}");
+            assert_eq!(encode_every_level(&decoded), s, "shift {shift}");
         }
     }
 
@@ -972,7 +1217,7 @@ mod tests {
     /// otherwise valid 64-character input.
     #[test]
     fn every_invalid_3byte_code_point() {
-        let valid: Vec<char> = crate::encode(&random_bytes(120, 7)).chars().collect();
+        let valid: Vec<char> = encode_every_level(&random_bytes(120, 7)).chars().collect();
         assert_eq!(valid.len(), 64);
         for cp in 0x800..=0xFFFFu32 {
             let Some(c) = char::from_u32(cp) else {
@@ -1039,6 +1284,15 @@ mod tests {
             };
             decode_every_level(copy)
         };
+        let encode_at_end = |b: &[u8]| {
+            // SAFETY: `b` fits in the accessible first half.
+            let copy = unsafe {
+                let dst = end.sub(b.len());
+                std::ptr::copy_nonoverlapping(b.as_ptr(), dst, b.len());
+                std::slice::from_raw_parts(dst, b.len())
+            };
+            encode_every_level(copy)
+        };
 
         let random = random_bytes(600, 11);
         // Zero bytes encode to 2-byte characters, which take the fallback paths.
@@ -1049,7 +1303,7 @@ mod tests {
             .collect();
         for data in [&random, &mixed] {
             for n in 0..=data.len() {
-                let encoded = crate::encode(&data[..n]);
+                let encoded = encode_at_end(&data[..n]);
                 assert_eq!(decode_at_end(&encoded).unwrap(), &data[..n], "{n}");
                 let bad = format!("{encoded}\u{3000}");
                 assert!(decode_at_end(&bad).is_err(), "{n}");

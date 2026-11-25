@@ -118,6 +118,39 @@ fn main() {
         half_prefix[2 * id + 1] = (bitmap & 0xFFFF).count_ones() as u16;
     }
 
+    // Select tables for the AVX-512 encode path. z is split into 32 groups of
+    // 1024 values (32 blocks). Block b of group g starts at code point
+    // ((base_g + b + delta_p[b]) << 5), where delta_p counts the 32-code-point
+    // blocks skipped so far inside the group and p is one of a few patterns.
+    let mut encode_desc = vec![0u16; 32];
+    let mut encode_patterns: Vec<[u8; 32]> = vec![];
+    for g in 0..32 {
+        let blocks = &z15_blocks[g * 32..g * 32 + 32];
+        let base = blocks[0] >> BLOCK_BITS;
+        let mut delta = [0u8; 32];
+        for (b, &cp) in blocks.iter().enumerate() {
+            let d = (cp >> BLOCK_BITS) - base - b as u32;
+            delta[b] = u8::try_from(d).unwrap();
+        }
+        let id = match encode_patterns.iter().position(|x| *x == delta) {
+            Some(i) => i,
+            None => {
+                encode_patterns.push(delta);
+                encode_patterns.len() - 1
+            }
+        };
+        encode_desc[g] = u16::try_from(base << 3 | id as u32).unwrap();
+    }
+    assert!(
+        encode_patterns.len() <= 8,
+        "{} encode patterns",
+        encode_patterns.len()
+    );
+    let mut encode_delta = vec![0u8; 256];
+    for (id, pat) in encode_patterns.iter().enumerate() {
+        encode_delta[id * 32..id * 32 + 32].copy_from_slice(pat);
+    }
+
     // Encode tables: packed UTF-8 for every value.
     let expand =
         |blocks: &[u32]| -> Vec<u32> { chars(blocks).into_iter().map(packed_utf8).collect() };
@@ -168,6 +201,21 @@ fn main() {
         "HALF_PREFIX",
         "u16",
         &half_prefix,
+    );
+
+    write_array(
+        &mut out,
+        "/// Per 1024-value group: `first block (cp >> 5) << 3 | pattern`.",
+        "ENCODE_DESC",
+        "u16",
+        &encode_desc,
+    );
+    write_array(
+        &mut out,
+        "/// Skipped blocks before block b of a group, indexed by `pattern << 5 | b`.",
+        "ENCODE_DELTA",
+        "u8",
+        &encode_delta,
     );
 
     std::fs::write(
