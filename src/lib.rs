@@ -342,7 +342,7 @@ const LEVEL_SCALAR: u8 = 0;
     allow(dead_code)
 )]
 const LEVEL_SIMD: u8 = 1;
-/// AVX-512 (BW, VBMI, BITALG) on x86-64.
+/// AVX-512 (BW, VBMI, VBMI2, BITALG) on x86-64.
 const LEVEL_AVX512: u8 = 2;
 
 /// [`decode_append`] into a new `Vec`.
@@ -500,7 +500,7 @@ unsafe fn read_8<const SIMD: bool>(p: *const u8) -> ([u32; 8], usize) {
 ///
 /// # Safety
 /// `dst` must have room for `decoded_capacity(bytes.len()) - 1` bytes; with `SIMD`, see
-/// [`read_8`]; with `AVX512`, the CPU must support AVX-512 BW, VBMI and BITALG.
+/// [`read_8`]; with `AVX512`, the CPU must support AVX-512 BW, VBMI, VBMI2 and BITALG.
 /// `DENSE` (with `AVX512`) adds a path for windows of 2-byte characters; see
 /// [`decode_fast_dispatch`] for why it is a separate instance.
 #[inline(always)]
@@ -593,18 +593,19 @@ unsafe fn decode_fast_dispatch<const LEVEL: u8>(
         && std::is_x86_feature_detected!("avx512bw")
         && std::is_x86_feature_detected!("avx512vbmi")
         && std::is_x86_feature_detected!("avx512bitalg")
+        && std::is_x86_feature_detected!("avx512vbmi2")
     {
         // Two separate functions: in one, the 2-byte path's constants take
         // zmm registers from the 3-byte loop, which then reloads constants
         // from memory on every window (2-4% slower on random data). The input
         // is classified once by its first 64 bytes; either function decodes
         // any input correctly.
-        #[target_feature(enable = "ssse3,avx512f,avx512bw,avx512vbmi,avx512bitalg")]
+        #[target_feature(enable = "ssse3,avx512f,avx512bw,avx512vbmi,avx512vbmi2,avx512bitalg")]
         #[inline(never)]
         unsafe fn decode_fast_avx512(bytes: &[u8], dst: *mut u8) -> (usize, usize, usize) {
             unsafe { decode_fast::<true, true, false>(bytes, dst) }
         }
-        #[target_feature(enable = "ssse3,avx512f,avx512bw,avx512vbmi,avx512bitalg")]
+        #[target_feature(enable = "ssse3,avx512f,avx512bw,avx512vbmi,avx512vbmi2,avx512bitalg")]
         #[inline(never)]
         unsafe fn decode_fast_avx512_dense(bytes: &[u8], dst: *mut u8) -> (usize, usize, usize) {
             unsafe { decode_fast::<true, true, true>(bytes, dst) }
@@ -1106,7 +1107,7 @@ mod simd {
     /// 15-bit characters; those groups are written to `d` as 15 bytes each,
     /// and nothing else is written.
     #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "avx512f,avx512bw,avx512vbmi,avx512bitalg")]
+    #[target_feature(enable = "avx512f,avx512bw,avx512vbmi,avx512vbmi2,avx512bitalg")]
     #[inline]
     pub unsafe fn decode32_avx512(p: *const u8, d: *mut u8) -> usize {
         use crate::table;
@@ -1215,7 +1216,7 @@ mod simd {
     /// characters; those groups are written to `d` as 15 bytes each, and
     /// nothing else is written.
     #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "avx512f,avx512bw,avx512vbmi")]
+    #[target_feature(enable = "avx512f,avx512bw,avx512vbmi,avx512vbmi2")]
     #[inline]
     pub unsafe fn decode32_2byte_avx512(p: *const u8, d: *mut u8) -> usize {
         use crate::table;
@@ -1234,25 +1235,24 @@ mod simd {
         // Lanes from a character that is not 2 bytes long on are misaligned
         // and decode to garbage, but they are never stored (see `valid`).
         let v = ld(p);
-        let lead_ok = _mm512_cmpeq_epi16_mask(_mm512_and_si512(v, w(0xE0)), w(0xC0));
-        let cp = _mm512_ternarylogic_epi32::<0xF8>(
-            _mm512_slli_epi16::<6>(_mm512_and_si512(v, w(0x1F))),
-            _mm512_srli_epi16::<8>(v),
-            w(0x3F),
-        );
-        // Block index in the low byte (vpermb uses its low 6 bits, cp >> 5);
-        // the high byte gets entry 0, 0x80, and is masked off.
-        let block = _mm512_permutexvar_epi8(_mm512_srli_epi16::<5>(cp), ld(BLOCK.as_ptr()));
-        let valid = lead_ok & !_mm512_test_epi16_mask(block, w(0x80));
+        const EVEN: u64 = 0x5555_5555_5555_5555;
+        // Lead byte 0b110xxxxx: (lead ^ 0xC0) & 0xE0 == 0.
+        let lead_bits = _mm512_and_si512(_mm512_xor_si512(v, w(0xC0)), w(0xE0));
+        let lead_ok = _mm512_testn_epi16_mask(lead_bits, lead_bits);
+        // cp >> 5 = (lead & 0x1F) << 1 | bit 5 of the continuation byte (bit
+        // 13 of the lane): the low byte of (v << 1) | (v << 2) >> 15
+        // (vpshldw), of which vpermb uses the low 6 bits.
+        let index = _mm512_shldi_epi16::<1>(v, _mm512_slli_epi16::<2>(v));
+        // The z of the block's first character (0..=192), or 0xFF; the high
+        // bytes are zeroed.
+        let base = _mm512_maskz_permutexvar_epi8(EVEN, index, ld(BLOCK.as_ptr()));
+        let valid = lead_ok & _mm512_testn_epi16_mask(base, w(1));
         let groups = (valid.trailing_ones() / 8) as usize;
         if groups == 0 {
             return 0;
         }
-        let z = _mm512_ternarylogic_epi32::<0xF8>(
-            _mm512_slli_epi16::<5>(_mm512_and_si512(block, w(7))),
-            cp,
-            w(31),
-        );
+        // z = base | the continuation byte's low 5 bits (cp % 32).
+        let z = _mm512_ternarylogic_epi32::<0xF8>(base, _mm512_srli_epi16::<8>(v), w(0x1F));
 
         // Pack as in `decode32_avx512`.
         let m = _mm512_madd_epi16(z, _mm512_set1_epi32(((-1i32) << 16) | 0x8000));
@@ -1762,9 +1762,10 @@ mod tests {
     fn avx512_path_runs() {
         if !(std::is_x86_feature_detected!("avx512bw")
             && std::is_x86_feature_detected!("avx512vbmi")
+            && std::is_x86_feature_detected!("avx512vbmi2")
             && std::is_x86_feature_detected!("avx512bitalg"))
         {
-            eprintln!("AVX-512 BW/VBMI/BITALG not available; skipped");
+            eprintln!("AVX-512 BW/VBMI/VBMI2/BITALG not available; skipped");
             return;
         }
         let data: Vec<u8> = (0..3000).map(|i| (i * 7) as u8).collect();
@@ -1782,9 +1783,10 @@ mod tests {
     fn avx512_2byte_path_runs() {
         if !(std::is_x86_feature_detected!("avx512bw")
             && std::is_x86_feature_detected!("avx512vbmi")
+            && std::is_x86_feature_detected!("avx512vbmi2")
             && std::is_x86_feature_detected!("avx512bitalg"))
         {
-            eprintln!("AVX-512 BW/VBMI/BITALG not available; skipped");
+            eprintln!("AVX-512 BW/VBMI/VBMI2/BITALG not available; skipped");
             return;
         }
         let blocks = || crate::simd::AVX512_2BYTE_BLOCKS.with(|n| n.get());
