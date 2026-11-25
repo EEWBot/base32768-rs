@@ -135,9 +135,10 @@ fn encode_impl<const LEVEL: u8>(b: &[u8]) -> String {
         (done, pos) = unsafe { encode_avx512(b, dst) };
     }
 
-    // AVX2 (CPUs without the AVX-512 path): 60 bytes -> 32 characters.
+    // AVX2: 60 bytes -> 32 characters. After the AVX-512 path fewer than 60
+    // bytes remain, so this runs only on CPUs without it.
     #[cfg(target_arch = "x86_64")]
-    if LEVEL == LEVEL_SIMD && std::is_x86_feature_detected!("avx2") {
+    if LEVEL >= LEVEL_SIMD && b.len() - done >= 61 && std::is_x86_feature_detected!("avx2") {
         #[target_feature(enable = "avx2")]
         unsafe fn encode_avx2(
             b: &[u8],
@@ -1649,9 +1650,11 @@ mod tests {
     fn encode_every_value_every_lane() {
         for lane in 0..32u16 {
             let mut values: Vec<u16> = (0..lane).map(|i| 0x7FFF - i).chain(0..32768).collect();
-            // Whole 32-character blocks, so no value is left to the scalar tail.
+            // Whole 32-character blocks, plus one byte because the AVX2 path
+            // needs 61 bytes for a block, so no value is left to the scalar tail.
             values.resize(values.len().next_multiple_of(32), 0x7FFF);
-            let data = pack_z15(&values);
+            let mut data = pack_z15(&values);
+            data.push(0xA5);
             let encoded = encode_every_level(&data);
             assert_eq!(decode_every_level(&encoded).unwrap(), data, "lane {lane}");
         }
@@ -1663,7 +1666,9 @@ mod tests {
                 if let Some(j) = j {
                     values[j] = 223;
                 }
-                let data = pack_z15(&values);
+                let mut data = pack_z15(&values);
+                // Both blocks of 32 take the AVX2 path too.
+                data.push(0xA5);
                 let encoded = encode_every_level(&data);
                 assert_eq!(decode_every_level(&encoded).unwrap(), data, "{i} {j:?}");
             }
