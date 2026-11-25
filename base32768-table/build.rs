@@ -83,74 +83,6 @@ fn main() {
         decode[cp as usize] = 0x8000 | z as u16;
     }
 
-    // Page + rank tables for the AVX-512 decode path. A page is 1024 code
-    // points (32 blocks) and its 32-bit bitmap marks the 15-bit blocks. The z
-    // of a code point is 32 * (number of 15-bit blocks below its block) +
-    // cp % 32, which holds because the blocks are in ascending order. Only 16
-    // distinct bitmaps occur, so each page stores the number of blocks before
-    // it and a pattern id; each pattern is split into two 16-block halves.
-    assert!(z15_blocks.is_sorted());
-    let mut bitmaps = [0u32; 64];
-    for &cp in &z15_blocks {
-        bitmaps[(cp >> 10) as usize] |= 1 << ((cp >> BLOCK_BITS) & 31);
-    }
-    let mut patterns: Vec<u32> = vec![];
-    let mut page_desc = vec![0u16; 64];
-    let mut prefix = 0u32;
-    for (page, &bitmap) in bitmaps.iter().enumerate() {
-        let id = match patterns.iter().position(|&x| x == bitmap) {
-            Some(i) => i,
-            None => {
-                patterns.push(bitmap);
-                patterns.len() - 1
-            }
-        };
-        page_desc[page] = (prefix << 5 | (id as u32) << 1) as u16;
-        prefix += bitmap.count_ones();
-    }
-    // The pattern id and half bit must fit the 5-bit `vpermw` index.
-    assert!(patterns.len() <= 16, "{} bitmap patterns", patterns.len());
-    let mut half_mask = vec![0u16; 32];
-    let mut half_prefix = vec![0u16; 32];
-    for (id, &bitmap) in patterns.iter().enumerate() {
-        half_mask[2 * id] = bitmap as u16;
-        half_mask[2 * id + 1] = (bitmap >> 16) as u16;
-        half_prefix[2 * id + 1] = (bitmap & 0xFFFF).count_ones() as u16;
-    }
-
-    // Select tables for the AVX-512 encode path. z is split into 32 groups of
-    // 1024 values (32 blocks). Block b of group g starts at code point
-    // ((base_g + b + delta_p[b]) << 5), where delta_p counts the 32-code-point
-    // blocks skipped so far inside the group and p is one of a few patterns.
-    let mut encode_desc = vec![0u16; 32];
-    let mut encode_patterns: Vec<[u8; 32]> = vec![];
-    for g in 0..32 {
-        let blocks = &z15_blocks[g * 32..g * 32 + 32];
-        let base = blocks[0] >> BLOCK_BITS;
-        let mut delta = [0u8; 32];
-        for (b, &cp) in blocks.iter().enumerate() {
-            let d = (cp >> BLOCK_BITS) - base - b as u32;
-            delta[b] = u8::try_from(d).unwrap();
-        }
-        let id = match encode_patterns.iter().position(|x| *x == delta) {
-            Some(i) => i,
-            None => {
-                encode_patterns.push(delta);
-                encode_patterns.len() - 1
-            }
-        };
-        encode_desc[g] = u16::try_from(base << 3 | id as u32).unwrap();
-    }
-    assert!(
-        encode_patterns.len() <= 8,
-        "{} encode patterns",
-        encode_patterns.len()
-    );
-    let mut encode_delta = vec![0u8; 256];
-    for (id, pat) in encode_patterns.iter().enumerate() {
-        encode_delta[id * 32..id * 32 + 32].copy_from_slice(pat);
-    }
-
     // AVX2 encode: cp = z + 32 * D(z), where D(z) = low + (z >= 0xD40) * 256.
     // For z < 0xDC0 or z >= 0x7DE0, low is byte z >> 5 & 127 of this table
     // (8 tables of 16 for vpshufb). Both ranges fit because they share no
@@ -182,6 +114,122 @@ fn main() {
             z15_cps[z as usize],
             "z {z:#x}"
         );
+    }
+
+    // AVX-512 encode: cp = z + 0x2000 * (z >= 0xD40) + 32 * low, where low
+    // (as in the AVX2 table) depends only on the block z >> 5. The 8 lows of
+    // each 1024 / 8 = 128 units of 8 blocks (u = z >> 8) form 22 distinct
+    // patterns, overlapped into one string of at most 128 bytes. A unit's
+    // start in it is stored biased by -8u (mod 128), so that adding the
+    // block's low 8 bits ((z >> 5) % 256 = 8 (u % 32) + b) gives start + b.
+    let unit_lows = |u: u32| -> Vec<u8> {
+        (0..8)
+            .map(|b| u8::try_from(d_of(u << 8 | b << 5) - high(u << 8 | b << 5)).unwrap())
+            .collect()
+    };
+    let mut strings: Vec<Vec<u8>> = vec![];
+    for u in 0..128 {
+        let p = unit_lows(u);
+        if !strings.contains(&p) {
+            strings.push(p);
+        }
+    }
+    // Greedy shortest common superstring: merge the pair with the longest
+    // overlap until one string is left.
+    let overlap = |a: &[u8], b: &[u8]| -> usize {
+        (0..=a.len().min(b.len()))
+            .rev()
+            .find(|&k| a[a.len() - k..] == b[..k])
+            .unwrap()
+    };
+    while strings.len() > 1 {
+        let mut best = (0, 1, 0);
+        for i in 0..strings.len() {
+            for j in 0..strings.len() {
+                if i != j {
+                    let k = overlap(&strings[i], &strings[j]);
+                    if k >= best.2 {
+                        best = (i, j, k);
+                    }
+                }
+            }
+        }
+        let (i, j, k) = best;
+        let mut merged = strings[i].clone();
+        merged.extend_from_slice(&strings[j][k..]);
+        strings.remove(i.max(j));
+        strings.remove(i.min(j));
+        strings.push(merged);
+    }
+    let mut encode_offset = strings.pop().unwrap();
+    assert!(encode_offset.len() <= 128, "{} bytes", encode_offset.len());
+    let mut encode_start = vec![0u8; 128];
+    for u in 0..128u32 {
+        let p = unit_lows(u);
+        let start = encode_offset.windows(8).position(|w| w == &p[..]).unwrap() as u32;
+        encode_start[u as usize] = (start.wrapping_sub(8 * u) & 127) as u8;
+    }
+    encode_offset.resize(128, 0);
+    for z in 0..0x8000u32 {
+        let idx = (encode_start[(z >> 8) as usize] as u32 + (z >> 5 & 0xFF)) & 127;
+        let low = encode_offset[idx as usize] as u32;
+        let cp = (z + 0x2000 * (z >= 0xD40) as u32 + (low << BLOCK_BITS)) & 0xFFFF;
+        assert_eq!(cp, z15_cps[z as usize], "z {z:#x}");
+    }
+
+    // AVX-512 decode: z = cp - 32 * (blocks below cp's block that are not
+    // 15-bit), which holds because the 15-bit blocks are in ascending order.
+    // Per half page h (512 code points, 16 blocks): the bitmap of its 15-bit
+    // blocks and 32 * the non-15-bit blocks before it. The 128 half pages
+    // share 27 distinct entries (all halves without 15-bit blocks share one),
+    // so the SIMD code looks up an entry index and then the entry.
+    assert!(z15_blocks.is_sorted());
+    let is15 = |blk: u32| decode[(blk << BLOCK_BITS) as usize] < 0x8000;
+    let mut entries: Vec<(u16, u16)> = vec![(0, 0)];
+    let mut half_desc = [0u8; 128];
+    let mut missing = 0u32;
+    for h in 0..128u32 {
+        let mask = (0..16).fold(0u16, |m, i| m | (is15(h * 16 + i) as u16) << i);
+        let e = if mask == 0 {
+            (0, 0)
+        } else {
+            (mask, (missing << BLOCK_BITS) as u16)
+        };
+        missing += 16 - mask.count_ones();
+        let i = entries.iter().position(|&x| x == e).unwrap_or_else(|| {
+            entries.push(e);
+            entries.len() - 1
+        });
+        half_desc[h as usize] = i as u8;
+    }
+    // Entry indices are `vpermw` indices.
+    assert!(entries.len() <= 32, "{} half page entries", entries.len());
+    // The SIMD code computes t = 64 * b0 + b1 from the first two UTF-8 bytes
+    // with `vpmaddubsw`: t >> 3 is (cp >> 9) + 0x710 and t << 6 is
+    // cp + 0x2000 (mod 2^16). The tables absorb both offsets.
+    let mut half_desc_biased = vec![0u8; 128];
+    for h in 0..128 {
+        half_desc_biased[(h + 0x10) & 127] = half_desc[h];
+    }
+    let mut valid_mask = vec![0u16; 32];
+    let mut base_offset_biased = vec![0u16; 32];
+    for (i, &(mask, offset)) in entries.iter().enumerate() {
+        valid_mask[i] = mask;
+        base_offset_biased[i] = offset.wrapping_add(0x2000);
+    }
+    for cp in 0x800..0x10000u32 {
+        let (b0, b1) = (0xE0 | cp >> 12, 0x80 | (cp >> 6 & 0x3F));
+        let t = 64 * b0 + b1;
+        let i = half_desc_biased[(t >> 3 & 127) as usize] as usize;
+        let cp_adj = (t << 6 | (cp & 0x3F)) & 0xFFFF;
+        let bit = 1u32 << (cp_adj >> 5 & 15);
+        let mask = valid_mask[i] as u32;
+        assert_eq!(mask & bit != 0, decode[cp as usize] < 0x8000, "U+{cp:04X}");
+        if mask & bit != 0 {
+            let holes = (!mask & (bit - 1)).count_ones();
+            let z = cp_adj.wrapping_sub(base_offset_biased[i] as u32 + (holes << 5)) & 0xFFFF;
+            assert_eq!(z, decode[cp as usize] as u32, "U+{cp:04X}");
+        }
     }
 
     // Encode tables: packed UTF-8 for every value.
@@ -216,47 +264,46 @@ fn main() {
 
     write_array(
         &mut out,
-        "/// Per 1024-code-point page: `15-bit blocks before the page << 5 | pattern << 1`.",
-        "PAGE_DESC",
-        "u16",
-        &page_desc,
-    );
-    write_array(
-        &mut out,
-        "/// 15-bit block bitmap of a half page (16 blocks), indexed by `pattern << 1 | half`.",
-        "HALF_MASK",
-        "u16",
-        &half_mask,
-    );
-    write_array(
-        &mut out,
-        "/// 15-bit blocks in the first half of the page, indexed like `HALF_MASK`.",
-        "HALF_PREFIX",
-        "u16",
-        &half_prefix,
-    );
-
-    write_array(
-        &mut out,
-        "/// Per 1024-value group: `first block (cp >> 5) << 3 | pattern`.",
-        "ENCODE_DESC",
-        "u16",
-        &encode_desc,
-    );
-    write_array(
-        &mut out,
-        "/// Skipped blocks before block b of a group, indexed by `pattern << 5 | b`.",
-        "ENCODE_DELTA",
-        "u8",
-        &encode_delta,
-    );
-
-    write_array(
-        &mut out,
         "/// AVX2 encode offsets (see build.rs).",
         "ENCODE_AVX2",
         "u8",
         &encode_avx2,
+    );
+
+    write_array(
+        &mut out,
+        "/// AVX-512 encode: per 8-block unit, start in `ENCODE_OFFSET` - 8 * unit (mod 128).",
+        "ENCODE_START_BIASED",
+        "u8",
+        &encode_start,
+    );
+    write_array(
+        &mut out,
+        "/// AVX-512 encode: block offsets (see build.rs), shared between units.",
+        "ENCODE_OFFSET",
+        "u8",
+        &encode_offset,
+    );
+    write_array(
+        &mut out,
+        "/// AVX-512 decode: entry index of half page `(h + 16) % 128`.",
+        "HALF_DESC_BIASED",
+        "u8",
+        &half_desc_biased,
+    );
+    write_array(
+        &mut out,
+        "/// AVX-512 decode: bitmap of a half page's 15-bit blocks, per entry.",
+        "VALID_MASK",
+        "u16",
+        &valid_mask,
+    );
+    write_array(
+        &mut out,
+        "/// AVX-512 decode: 32 * non-15-bit blocks before the half page, + 0x2000.",
+        "BASE_OFFSET_BIASED",
+        "u16",
+        &base_offset_biased,
     );
 
     std::fs::write(

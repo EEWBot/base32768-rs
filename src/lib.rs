@@ -868,15 +868,14 @@ mod simd {
         }
     }
 
-    /// Encodes the 60 bytes at `src` as 32 characters at `d`, without table
-    /// lookups, and returns the number of bytes written (64..=96). Writes
-    /// nothing past them.
+    /// Encodes the 60 bytes at `src` as 32 characters at `d`, with table
+    /// lookups only in registers, and returns the number of bytes written
+    /// (64..=96). Writes nothing past them.
     ///
-    /// The top 5 bits of a 15-bit value z select one of 32 groups of 32
-    /// blocks (32 code points each). Block b of group g starts at code point
-    /// `((ENCODE_DESC[g] >> 3) + b + delta) << 5`, where `delta`, the number
-    /// of blocks skipped so far in the group, is
-    /// `ENCODE_DELTA[(ENCODE_DESC[g] & 7) << 5 | b]`.
+    /// The code point of a 15-bit value z is
+    /// `z + 0x2000 * (z >= 0xD40) + 32 * low`, where `low` depends only on
+    /// the block `z >> 5`: byte `(ENCODE_START_BIASED[z >> 8] + (z >> 5)) % 128`
+    /// of `ENCODE_OFFSET` (see build.rs).
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx512f,avx512bw,avx512vbmi,avx512vbmi2")]
     #[inline]
@@ -943,12 +942,12 @@ mod simd {
             m
         }
         static OUT2: [u8; 64] = utf8_idx2();
-        static DESC: [u16; 32] = table::ENCODE_DESC;
-        static DELTA: [u8; 256] = table::ENCODE_DELTA;
+        static START: [u8; 128] = table::ENCODE_START_BIASED;
+        static OFF: [u8; 128] = table::ENCODE_OFFSET;
         // SAFETY: each load reads 64 bytes from a table at least that long.
         let ld = |p: *const u8| unsafe { _mm512_loadu_si512(p.cast()) };
         let w = |x: i16| _mm512_set1_epi16(x);
-        const EVEN: u64 = 0x5555_5555_5555_5555;
+        const ODD: u64 = 0xAAAA_AAAA_AAAA_AAAA;
         const M48: u64 = (1 << 48) - 1;
 
         // 60 bytes -> 32 x 15-bit values. The masked load touches only 60 bytes.
@@ -961,24 +960,17 @@ mod simd {
             _mm512_srlv_epi16(y, ld(SHR.as_ptr().cast())),
         ));
 
-        // z -> code point.
-        let desc = _mm512_permutexvar_epi16(_mm512_srli_epi16::<10>(z), ld(DESC.as_ptr().cast()));
-        let block = _mm512_and_si512(_mm512_srli_epi16::<5>(z), w(31));
-        let idx = _mm512_or_si512(_mm512_slli_epi16::<5>(_mm512_and_si512(desc, w(7))), block);
-        // Byte lookups in the 256-byte delta table: one per 128-byte half,
-        // picked by bit 7 of the index. The odd (high) bytes are zeroed.
-        let d_lo =
-            _mm512_maskz_permutex2var_epi8(EVEN, ld(DELTA.as_ptr()), idx, ld(DELTA[64..].as_ptr()));
-        let d_hi = _mm512_maskz_permutex2var_epi8(
-            EVEN,
-            ld(DELTA[128..].as_ptr()),
-            idx,
-            ld(DELTA[192..].as_ptr()),
-        );
-        let delta = _mm512_mask_blend_epi16(_mm512_cmpge_epu16_mask(idx, w(128)), d_lo, d_hi);
-        let cp_block =
-            _mm512_add_epi16(_mm512_add_epi16(_mm512_srli_epi16::<3>(desc), block), delta);
-        let cp = _mm512_or_si512(_mm512_slli_epi16::<5>(cp_block), _mm512_and_si512(z, w(31)));
+        // z -> code point, in the high byte of each u16 lane: vpermi2b uses
+        // the low 7 bits of each index byte, z >> 8 (the unit) for the start,
+        // then start + (z >> 5) % 256 for `low`. The low bytes are ignored and
+        // zeroed.
+        let hi = _mm512_cmpge_epu16_mask(z, w(0x0D40));
+        let z_adj = _mm512_mask_add_epi16(z, hi, z, w(0x2000));
+        let start = _mm512_permutex2var_epi8(ld(START.as_ptr()), z, ld(START[64..].as_ptr()));
+        let idx = _mm512_add_epi8(start, _mm512_slli_epi16::<3>(z));
+        let low_hi =
+            _mm512_maskz_permutex2var_epi8(ODD, ld(OFF.as_ptr()), idx, ld(OFF[64..].as_ptr()));
+        let cp = _mm512_add_epi16(z_adj, _mm512_srli_epi16::<3>(low_hi));
 
         // UTF-8 as 3 bytes per character; 2-byte characters get a leading 0,
         // the only zero byte (every other byte has its top bit set).
@@ -1045,12 +1037,18 @@ mod simd {
         use crate::table;
         use core::arch::x86_64::*;
 
-        /// vpermi2b indices putting byte `K` of character i in the low byte of u16 lane i.
-        const fn char_bytes<const K: usize>() -> [u8; 64] {
+        /// vpermi2b indices: bytes 0 (high byte) and 1 (low byte) of
+        /// character i in u16 lane i, or byte 2 in the low byte.
+        const fn char_bytes(third: bool) -> [u8; 64] {
             let mut m = [0u8; 64];
             let mut i = 0;
             while i < 32 {
-                m[2 * i] = (3 * i + K) as u8;
+                if third {
+                    m[2 * i] = (3 * i + 2) as u8;
+                } else {
+                    m[2 * i] = (3 * i + 1) as u8;
+                    m[2 * i + 1] = (3 * i) as u8;
+                }
                 i += 1;
             }
             m
@@ -1077,15 +1075,14 @@ mod simd {
             }
             m
         }
-        static I0: [u8; 64] = char_bytes::<0>();
-        static I1: [u8; 64] = char_bytes::<1>();
-        static I2: [u8; 64] = char_bytes::<2>();
+        static I01: [u8; 64] = char_bytes(false);
+        static I2: [u8; 64] = char_bytes(true);
         static PACK: [u8; 64] = pack_order();
         static SHL: [u32; 16] = shifts([2, 4, 6, 8]);
         static SHR: [u32; 16] = shifts([28, 26, 24, 32]);
-        static DESC: [u16; 64] = table::PAGE_DESC;
-        static HMASK: [u16; 32] = table::HALF_MASK;
-        static HPREFIX: [u16; 32] = table::HALF_PREFIX;
+        static HDESC: [u8; 128] = table::HALF_DESC_BIASED;
+        static VMASK: [u16; 32] = table::VALID_MASK;
+        static BOFF: [u16; 32] = table::BASE_OFFSET_BIASED;
         // SAFETY (every use): `p` points to a 64-byte array or into the
         // readable input.
         let ld = |p: *const u8| unsafe { _mm512_loadu_si512(p.cast()) };
@@ -1099,32 +1096,32 @@ mod simd {
                 _mm512_maskz_loadu_epi8(0xFFFF_FFFF, p.add(64).cast()),
             )
         };
-        const EVEN: u64 = 0x5555_5555_5555_5555;
-        let b0 = _mm512_maskz_permutex2var_epi8(EVEN, a, ld(I0.as_ptr()), b);
-        // Lanes from a character that is not 3 bytes long on are misaligned
-        // and decode to garbage, but they are never stored (see `valid`).
-        let lead_ok = _mm512_cmpeq_epi16_mask(_mm512_and_si512(b0, w(0xF0)), w(0xE0));
-        let b1 = _mm512_maskz_permutex2var_epi8(EVEN, a, ld(I1.as_ptr()), b);
-        let b2 = _mm512_maskz_permutex2var_epi8(EVEN, a, ld(I2.as_ptr()), b);
-        let cp = _mm512_or_si512(
-            _mm512_or_si512(
-                _mm512_slli_epi16::<12>(b0),
-                _mm512_slli_epi16::<6>(_mm512_and_si512(b1, w(0x3F))),
-            ),
-            _mm512_and_si512(b2, w(0x3F)),
+        // u16 lane i: b0 << 8 | b1 of character i, and b2. Lanes from a
+        // character that is not 3 bytes long on are misaligned and decode to
+        // garbage, but they are never stored (see `valid`).
+        let b0b1 = _mm512_permutex2var_epi8(a, ld(I01.as_ptr()), b);
+        let lead_ok = _mm512_cmpeq_epi16_mask(
+            _mm512_and_si512(b0b1, w(0xF000u16 as i16)),
+            w(0xE000u16 as i16),
         );
+        let b2 = _mm512_permutex2var_epi8(a, ld(I2.as_ptr()), b);
+        // t = 64 * b0 + b1 (vpmaddubsw), so t >> 3 = (cp >> 9) + 0x710 and,
+        // with the low 6 bits of b2, t << 6 gives cp + 0x2000 (mod 2^16). The
+        // tables absorb both offsets, and the half page lookup does not wait
+        // for b2. vpermi2b uses the low 7 bits of t >> 3, vpermw the low 5
+        // bits of the entry index (its high byte is garbage).
+        let t = _mm512_maddubs_epi16(b0b1, w(0x4001));
+        let entry = _mm512_permutex2var_epi8(
+            ld(HDESC.as_ptr()),
+            _mm512_srli_epi16::<3>(t),
+            ld(HDESC[64..].as_ptr()),
+        );
+        let cp = _mm512_ternarylogic_epi32::<0xF8>(_mm512_slli_epi16::<6>(t), b2, w(0x3F));
 
-        // Page + rank: z = 32 * (blocks before the page + blocks before the
-        // half + 15-bit blocks below this one in the half) + cp % 32.
-        let desc = _mm512_permutex2var_epi16(
-            ld(DESC.as_ptr().cast()),
-            _mm512_srli_epi16::<10>(cp),
-            ld(DESC[32..].as_ptr().cast()),
-        );
-        // vpermw uses only the low 5 index bits: pattern << 1 | half.
-        let half = _mm512_ternarylogic_epi32::<0xF8>(desc, _mm512_srli_epi16::<9>(cp), w(1));
-        let mask = _mm512_permutexvar_epi16(half, ld(HMASK.as_ptr().cast()));
-        let hprefix = _mm512_permutexvar_epi16(half, ld(HPREFIX.as_ptr().cast()));
+        // z = cp - 32 * (non-15-bit blocks before the half page) - 32 *
+        // (non-15-bit blocks below this one in the half page).
+        let mask = _mm512_permutexvar_epi16(entry, ld(VMASK.as_ptr().cast()));
+        let offset = _mm512_permutexvar_epi16(entry, ld(BOFF.as_ptr().cast()));
         let bit = _mm512_sllv_epi16(w(1), _mm512_and_si512(_mm512_srli_epi16::<5>(cp), w(15)));
         let valid = lead_ok & _mm512_test_epi16_mask(mask, bit);
         // 8-character groups before the first rejected lane. With none, skip
@@ -1133,12 +1130,9 @@ mod simd {
         if groups == 0 {
             return 0;
         }
-        let rank = _mm512_popcnt_epi16(_mm512_and_si512(mask, _mm512_sub_epi16(bit, w(1))));
-        let blocks = _mm512_add_epi16(
-            _mm512_add_epi16(_mm512_srli_epi16::<5>(desc), hprefix),
-            rank,
-        );
-        let z = _mm512_or_si512(_mm512_slli_epi16::<5>(blocks), _mm512_and_si512(cp, w(31)));
+        let base = _mm512_sub_epi16(cp, offset);
+        let holes = _mm512_popcnt_epi16(_mm512_andnot_si512(mask, _mm512_sub_epi16(bit, w(1))));
+        let z = _mm512_sub_epi16(base, _mm512_slli_epi16::<5>(holes));
 
         // Pack: dword i = z[2i] << 15 | z[2i+1] (madd by -32768, -1, negated),
         // then per 128-bit lane w_i = p_i << (2i+2) | p_{i+1} >> (28-2i).
@@ -1866,16 +1860,17 @@ mod tests {
         }
     }
 
-    /// The page + rank tables used by the AVX-512 path, evaluated in scalar
-    /// code, agree with `DECODE` for every code point U+0000..=U+FFFF.
+    /// The half page tables used by the AVX-512 decode path, evaluated in
+    /// scalar code as there, agree with `DECODE` for every 3-byte code point.
     #[test]
-    fn rank_tables_match_decode_table() {
-        use crate::table::{DECODE, HALF_MASK, HALF_PREFIX, PAGE_DESC};
-        for cp in 0..=0xFFFFu32 {
-            let desc = PAGE_DESC[cp as usize >> 10] as u32;
-            let half = ((desc | (cp >> 9 & 1)) & 31) as usize;
-            let mask = HALF_MASK[half] as u32;
-            let bit = 1 << (cp >> 5 & 15);
+    fn half_page_tables_match_decode_table() {
+        use crate::table::{BASE_OFFSET_BIASED, DECODE, HALF_DESC_BIASED, VALID_MASK};
+        for cp in 0x800..=0xFFFFu32 {
+            let t = 64 * (0xE0 | cp >> 12) + (0x80 | (cp >> 6 & 0x3F));
+            let entry = HALF_DESC_BIASED[(t >> 3 & 127) as usize] as usize;
+            let cp_adj = (t << 6 | (cp & 0x3F)) & 0xFFFF;
+            let mask = VALID_MASK[entry] as u32;
+            let bit = 1 << (cp_adj >> 5 & 15);
             let expected = DECODE[cp as usize];
             if mask & bit == 0 {
                 assert!(
@@ -1884,8 +1879,8 @@ mod tests {
                 );
                 continue;
             }
-            let rank = (mask & (bit - 1)).count_ones();
-            let z = ((desc >> 5) + HALF_PREFIX[half] as u32 + rank) << 5 | (cp & 31);
+            let holes = (!mask & (bit - 1)).count_ones();
+            let z = cp_adj.wrapping_sub(BASE_OFFSET_BIASED[entry] as u32 + 32 * holes) & 0xFFFF;
             assert_eq!(z, expected as u32, "U+{cp:04X}");
         }
     }
