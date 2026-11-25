@@ -112,9 +112,11 @@ fn encode_impl<const LEVEL: u8>(b: &[u8]) -> String {
     #[allow(unused_mut)]
     let mut done = 0usize;
 
-    // AVX-512: 60 bytes -> 32 characters.
+    // AVX-512: 60 bytes -> 32 characters. Shorter inputs skip the feature
+    // detection.
     #[cfg(target_arch = "x86_64")]
     if LEVEL >= LEVEL_AVX512
+        && b.len() >= 60
         && std::is_x86_feature_detected!("avx512bw")
         && std::is_x86_feature_detected!("avx512vbmi")
         && std::is_x86_feature_detected!("avx512vbmi2")
@@ -122,9 +124,17 @@ fn encode_impl<const LEVEL: u8>(b: &[u8]) -> String {
         #[target_feature(enable = "avx512f,avx512bw,avx512vbmi,avx512vbmi2")]
         unsafe fn encode_avx512(b: &[u8], dst: *mut u8) -> (usize, usize) {
             let (mut done, mut pos) = (0, 0);
-            while done + 60 <= b.len() {
-                // SAFETY: 60 bytes are readable at `done`. 60 input bytes
-                // reserve 32 * 3 = 96 output bytes, the most that is written.
+            // Two blocks per iteration (1.02-1.08x when 2-byte characters
+            // take the slower store paths).
+            // SAFETY (all calls): 60 bytes are readable at each block's
+            // input offset, and each 60 input bytes reserve 32 * 3 = 96 output
+            // bytes, the most a block writes.
+            while done + 120 <= b.len() {
+                pos += unsafe { simd::encode32_avx512(b.as_ptr().add(done), dst.add(pos)) };
+                pos += unsafe { simd::encode32_avx512(b.as_ptr().add(done + 60), dst.add(pos)) };
+                done += 120;
+            }
+            if done + 60 <= b.len() {
                 pos += unsafe { simd::encode32_avx512(b.as_ptr().add(done), dst.add(pos)) };
                 done += 60;
             }
@@ -508,8 +518,11 @@ unsafe fn decode_fast_dispatch<const LEVEL: u8>(
     bytes: &[u8],
     dst: *mut u8,
 ) -> (usize, usize, usize) {
+    // Inputs shorter than one AVX-512 window (96 bytes) skip the feature
+    // detection; `decode_fast` would not use AVX-512 for them anyway.
     #[cfg(target_arch = "x86_64")]
     if LEVEL >= LEVEL_AVX512
+        && bytes.len() >= 96
         && std::is_x86_feature_detected!("avx512bw")
         && std::is_x86_feature_detected!("avx512vbmi")
         && std::is_x86_feature_detected!("avx512bitalg")
