@@ -135,6 +135,30 @@ fn encode_impl<const LEVEL: u8>(b: &[u8]) -> String {
         (done, pos) = unsafe { encode_avx512(b, dst) };
     }
 
+    // AVX2 (CPUs without the AVX-512 path): 60 bytes -> 32 characters.
+    #[cfg(target_arch = "x86_64")]
+    if LEVEL == LEVEL_SIMD && std::is_x86_feature_detected!("avx2") {
+        #[target_feature(enable = "avx2")]
+        unsafe fn encode_avx2(
+            b: &[u8],
+            dst: *mut u8,
+            mut done: usize,
+            mut pos: usize,
+        ) -> (usize, usize) {
+            // At least 61 bytes: the last 16-byte load ends at done + 61, and
+            // the byte after the block reserves at least 3 + 1 output bytes
+            // beyond its 96, covering the 100 bytes the block may write.
+            while done + 61 <= b.len() {
+                // SAFETY: see above.
+                pos += unsafe { simd::encode32_avx2(b.as_ptr().add(done), dst.add(pos)) };
+                done += 60;
+            }
+            (done, pos)
+        }
+        // SAFETY: AVX2 was just checked.
+        (done, pos) = unsafe { encode_avx2(b, dst, done, pos) };
+    }
+
     // Fast path: 15 bytes -> 8 characters.
     let (chunks, remainder) = b[done..].as_chunks::<15>();
     for chunk in chunks {
@@ -519,6 +543,267 @@ unsafe fn decode_fast_dispatch<const LEVEL: u8>(
 /// Code points of eight 3-byte UTF-8 characters at `p .. p + 24`, or `None` if
 /// any of the eight lead bytes is not a 3-byte lead (0xE0..=0xEF).
 mod simd {
+    /// Encodes the 60 bytes at `src` (61 are read) as 32 characters at `d`
+    /// and returns the number of bytes (64..=96). Up to 100 bytes may be
+    /// written.
+    ///
+    /// Each half of 16 characters gets its 15-bit values in u16 lanes, using
+    /// multiplies in place of the variable shifts AVX2 lacks. Code points are
+    /// z + 32 * offset, the offset coming from 8 tables of 16 bytes that
+    /// both halves share.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    pub unsafe fn encode32_avx2(src: *const u8, d: *mut u8) -> usize {
+        use crate::table;
+        use core::arch::x86_64::*;
+
+        /// u16 lane l of each 128-bit half (15 input bytes): bytes j + 1, j
+        /// (x) or byte j + 2 in the high byte (y), where j = 15 * l / 8.
+        const fn unpack(y: bool) -> [u8; 32] {
+            let mut m = [0x80u8; 32];
+            let mut i = 0;
+            while i < 16 {
+                let (h, l) = (i / 8, i % 8);
+                let j = 15 * l / 8;
+                if y {
+                    m[16 * h + 2 * l + 1] = (j + 2) as u8;
+                } else {
+                    m[16 * h + 2 * l] = (j + 1) as u8;
+                    m[16 * h + 2 * l + 1] = j as u8;
+                }
+                i += 1;
+            }
+            m
+        }
+        /// 2^(15 i mod 8): the left shift that drops the previous value's bits.
+        const fn factors() -> [u16; 16] {
+            let mut m = [0u16; 16];
+            let mut i = 0;
+            while i < 16 {
+                m[i] = 1 << (15 * (i % 8) % 8);
+                i += 1;
+            }
+            m
+        }
+        /// Output bytes `from..from + 16` of each 128-bit half (8 characters,
+        /// 24 bytes): character k's bytes are A[2k], A[2k + 1] and B[2k].
+        const fn utf8(b: bool, from: usize) -> [u8; 32] {
+            let mut m = [0x80u8; 32];
+            let mut h = 0;
+            while h < 2 {
+                let mut o = 0;
+                while o < 16 && from + o < 24 {
+                    let (k, part) = ((from + o) / 3, (from + o) % 3);
+                    if b && part == 2 {
+                        m[16 * h + o] = (2 * k) as u8;
+                    } else if !b && part < 2 {
+                        m[16 * h + o] = (2 * k + part) as u8;
+                    }
+                    o += 1;
+                }
+                h += 1;
+            }
+            m
+        }
+        static UNPACK_X: [u8; 32] = unpack(false);
+        static UNPACK_Y: [u8; 32] = unpack(true);
+        static FACTORS: [u16; 16] = factors();
+        static OUT_A0: [u8; 32] = utf8(false, 0);
+        static OUT_B0: [u8; 32] = utf8(true, 0);
+        static OUT_A1: [u8; 32] = utf8(false, 16);
+        static OUT_B1: [u8; 32] = utf8(true, 16);
+        static LOW: [u8; 128] = table::ENCODE_AVX2;
+        /// Per 4 characters in u32 lanes: keep bytes 0, 1 and, unless the
+        /// character is 2 bytes (mask bit set), byte 2.
+        const fn compress() -> [[u8; 16]; 16] {
+            let mut t = [[0x80u8; 16]; 16];
+            let mut m = 0;
+            while m < 16 {
+                let (mut o, mut k) = (0, 0);
+                while k < 4 {
+                    t[m][o] = (4 * k) as u8;
+                    t[m][o + 1] = (4 * k + 1) as u8;
+                    o += 2;
+                    if m >> k & 1 == 0 {
+                        t[m][o] = (4 * k + 2) as u8;
+                        o += 1;
+                    }
+                    k += 1;
+                }
+                m += 1;
+            }
+            t
+        }
+        static COMPRESS: [[u8; 16]; 16] = compress();
+
+        // SAFETY: the caller guarantees 61 readable bytes at `src` and 100
+        // writable bytes at `d`.
+        unsafe {
+            let ld = |p: *const u8| _mm256_loadu_si256(p.cast());
+            let k = |c: u16| _mm256_set1_epi16(c as i16);
+            let opaque = |mut v: __m256i| {
+                core::arch::asm!("/* {0} */", inout(ymm_reg) v, options(pure, nomem, nostack, preserves_flags));
+                v
+            };
+            // Hide the powers of two: LLVM otherwise turns the multiplies
+            // into 32-bit variable shifts plus packs and a vpermq.
+            let f = opaque(ld(FACTORS.as_ptr().cast()));
+            let unpack = |p: *const u8| {
+                let v = _mm256_loadu2_m128i(p.add(15).cast(), p.cast());
+                let x = _mm256_shuffle_epi8(v, ld(UNPACK_X.as_ptr()));
+                let y = _mm256_shuffle_epi8(v, ld(UNPACK_Y.as_ptr()));
+                // LLVM widens the mulhi intrinsic to 32 bits (vpmovzxwd, packs, vpermq).
+                let lo: __m256i;
+                core::arch::asm!("vpmulhuw {r}, {y}, {f}", r = lateout(ymm_reg) lo, y = in(ymm_reg) y, f = in(ymm_reg) f, options(pure, nomem, nostack, preserves_flags));
+                // Opaque so that LLVM keeps the signed compares as single vpcmpgtw.
+                opaque(_mm256_srli_epi16::<1>(_mm256_or_si256(
+                    _mm256_mullo_epi16(x, f),
+                    lo,
+                )))
+            };
+            let za = unpack(src);
+            let zb = unpack(src.add(30));
+
+            // z = (x << r | y >> (8 - r)) >> 1 with r = 15 l mod 8: the
+            // multiplies by 2^r stand in for per-lane shifts.
+
+            // Shared table lookup for all 32 characters: block index bits
+            // 0..=6 packed to bytes (in-lane: low half A, high half B).
+            let idx = |z: __m256i| _mm256_and_si256(_mm256_srli_epi16::<5>(z), k(127));
+            let indices = _mm256_packus_epi16(idx(za), idx(zb));
+            let lo4 = _mm256_and_si256(indices, _mm256_set1_epi8(0x0F));
+            let t = |n: usize| {
+                let tab =
+                    _mm256_broadcastsi128_si256(_mm_loadu_si128(LOW.as_ptr().add(16 * n).cast()));
+                _mm256_shuffle_epi8(tab, lo4)
+            };
+            // Index bits 4, 5, 6 to each byte's top bit (bits from the
+            // neighbouring byte only reach lower bits).
+            let m4 = _mm256_slli_epi16::<3>(indices);
+            let m5 = _mm256_slli_epi16::<2>(indices);
+            let m6 = _mm256_slli_epi16::<1>(indices);
+            let r01 = _mm256_blendv_epi8(t(0), t(1), m4);
+            let r23 = _mm256_blendv_epi8(t(2), t(3), m4);
+            let r45 = _mm256_blendv_epi8(t(4), t(5), m4);
+            let r67 = _mm256_blendv_epi8(t(6), t(7), m4);
+            let r03 = _mm256_blendv_epi8(r01, r23, m5);
+            let r47 = _mm256_blendv_epi8(r45, r67, m5);
+            let offsets = _mm256_blendv_epi8(r03, r47, m6);
+            let zero = _mm256_setzero_si256();
+
+            let code_points = |z: __m256i, lut8: __m256i| {
+                let gt = |c: u16| _mm256_cmpgt_epi16(z, k(c));
+                let lut = _mm256_add_epi16(lut8, _mm256_and_si256(gt(0xD3F), k(256)));
+                // Outside the tables: 306, 307 or 309.
+                let m2 = gt(0x795F);
+                let default = _mm256_sub_epi16(
+                    _mm256_sub_epi16(_mm256_sub_epi16(k(306), gt(0x275F)), m2),
+                    m2,
+                );
+                let use_lut = _mm256_or_si256(_mm256_cmpgt_epi16(k(0xDC0), z), gt(0x7DDF));
+                let off = _mm256_blendv_epi8(default, lut, use_lut);
+                _mm256_add_epi16(z, _mm256_slli_epi16::<5>(off))
+            };
+            let cpa = code_points(za, _mm256_unpacklo_epi8(offsets, zero));
+            let cpb = code_points(zb, _mm256_unpackhi_epi8(offsets, zero));
+
+            // 16 three-byte characters -> 48 bytes.
+            let store3 = |cp: __m256i, d: *mut u8| {
+                // A = lead byte | second byte << 8, B = third byte.
+                let a = _mm256_or_si256(
+                    _mm256_or_si256(_mm256_srli_epi16::<12>(cp), k(0x80E0)),
+                    _mm256_and_si256(_mm256_slli_epi16::<2>(cp), k(0x3F00)),
+                );
+                let b = _mm256_or_si256(_mm256_and_si256(cp, k(0x3F)), k(0x80));
+                let o0 = _mm256_or_si256(
+                    _mm256_shuffle_epi8(a, ld(OUT_A0.as_ptr())),
+                    _mm256_shuffle_epi8(b, ld(OUT_B0.as_ptr())),
+                );
+                let o1 = _mm256_or_si256(
+                    _mm256_shuffle_epi8(a, ld(OUT_A1.as_ptr())),
+                    _mm256_shuffle_epi8(b, ld(OUT_B1.as_ptr())),
+                );
+                _mm_storeu_si128(d.cast(), _mm256_castsi256_si128(o0));
+                _mm_storel_epi64(d.add(16).cast(), _mm256_castsi256_si128(o1));
+                _mm_storeu_si128(d.add(24).cast(), _mm256_extracti128_si256::<1>(o0));
+                _mm_storel_epi64(d.add(40).cast(), _mm256_extracti128_si256::<1>(o1));
+            };
+
+            let two_a = _mm256_cmpgt_epi16(k(224), za);
+            let two_b = _mm256_cmpgt_epi16(k(224), zb);
+            let any = _mm256_or_si256(two_a, two_b);
+            if _mm256_testz_si256(any, any) != 0 {
+                #[cfg(test)]
+                count_avx2_half(0, 2);
+                store3(cpa, d);
+                store3(cpb, d.add(48));
+                return 96;
+            }
+            core::hint::cold_path();
+            let mut pos = 0;
+            for (cp, two) in [(cpa, two_a), (cpb, two_b)] {
+                let m = _mm256_movemask_epi8(two) as u32;
+                #[cfg(test)]
+                count_avx2_half(
+                    match m {
+                        0 => 0,
+                        u32::MAX => 1,
+                        _ => 2,
+                    },
+                    1,
+                );
+                if m == 0 {
+                    store3(cp, d.add(pos));
+                    pos += 48;
+                } else if m == u32::MAX {
+                    // 16 two-byte characters: UTF-8 fits each u16 lane.
+                    let b0 = _mm256_or_si256(_mm256_srli_epi16::<6>(cp), k(0xC0));
+                    let b1 = _mm256_or_si256(_mm256_and_si256(cp, k(0x3F)), k(0x80));
+                    _mm256_storeu_si256(
+                        d.add(pos).cast(),
+                        _mm256_or_si256(b0, _mm256_slli_epi16::<8>(b1)),
+                    );
+                    pos += 32;
+                } else {
+                    // Mixed: each character's bytes in a u32 lane, then
+                    // compress 4 characters at a time.
+                    let a3 = _mm256_or_si256(
+                        _mm256_or_si256(_mm256_srli_epi16::<12>(cp), k(0x80E0)),
+                        _mm256_and_si256(_mm256_slli_epi16::<2>(cp), k(0x3F00)),
+                    );
+                    let low6 = _mm256_or_si256(_mm256_and_si256(cp, k(0x3F)), k(0x80));
+                    let a2 = _mm256_or_si256(
+                        _mm256_or_si256(_mm256_srli_epi16::<6>(cp), k(0xC0)),
+                        _mm256_slli_epi16::<8>(low6),
+                    );
+                    let a = _mm256_blendv_epi8(a3, a2, two);
+                    let c0 = _mm256_unpacklo_epi16(a, low6);
+                    let c1 = _mm256_unpackhi_epi16(a, low6);
+                    // One bit per character.
+                    let mut bits = m & 0x5555_5555;
+                    bits = (bits | bits >> 1) & 0x3333_3333;
+                    bits = (bits | bits >> 2) & 0x0F0F_0F0F;
+                    bits = (bits | bits >> 4) & 0x00FF_00FF;
+                    bits = (bits | bits >> 8) & 0xFFFF;
+                    let quarters = [
+                        _mm256_castsi256_si128(c0),
+                        _mm256_castsi256_si128(c1),
+                        _mm256_extracti128_si256::<1>(c0),
+                        _mm256_extracti128_si256::<1>(c1),
+                    ];
+                    for (q, v) in quarters.into_iter().enumerate() {
+                        let n = (bits >> (4 * q) & 15) as usize;
+                        let mask = _mm_loadu_si128(COMPRESS[n].as_ptr().cast());
+                        _mm_storeu_si128(d.add(pos).cast(), _mm_shuffle_epi8(v, mask));
+                        pos += 12 - n.count_ones() as usize;
+                    }
+                }
+            }
+            pos
+        }
+    }
+
     /// Encodes the 60 bytes at `src` as 32 characters at `d`, without table
     /// lookups, and returns the number of bytes written (64..=96). Writes
     /// nothing past them.
@@ -822,6 +1107,18 @@ mod simd {
         pub static AVX512_BLOCKS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
         /// Number of 60-byte blocks the AVX-512 path encoded on this thread.
         pub static AVX512_ENCODE_BLOCKS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+        /// Number of 16-character halves the AVX2 encode path stored as all
+        /// 3-byte, all 2-byte and mixed characters on this thread.
+        pub static AVX2_ENCODE_HALVES: core::cell::Cell<[usize; 3]> = const { core::cell::Cell::new([0; 3]) };
+    }
+
+    #[cfg(all(test, target_arch = "x86_64"))]
+    fn count_avx2_half(kind: usize, n: usize) {
+        AVX2_ENCODE_HALVES.with(|c| {
+            let mut v = c.get();
+            v[kind] += n;
+            c.set(v);
+        });
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -1018,6 +1315,7 @@ mod tests {
     /// Encodes with every fast path level, checking that they all agree.
     fn encode_every_level(b: &[u8]) -> String {
         let scalar = encode_impl::<LEVEL_SCALAR>(b);
+        assert_eq!(encode_impl::<LEVEL_SIMD>(b), scalar, "SIMD");
         assert_eq!(encode_impl::<LEVEL_AVX512>(b), scalar, "AVX-512");
         scalar
     }
@@ -1275,6 +1573,59 @@ mod tests {
         let encoded = encode_impl::<LEVEL_AVX512>(&data);
         assert_eq!(blocks() - before, 3000 / 60);
         assert_eq!(encoded, encode_impl::<LEVEL_SCALAR>(&data));
+    }
+
+    /// Every output path of the AVX2 encode block, in both halves: all
+    /// 3-byte, all 2-byte, and mixed with every 4-character pattern of 2-byte
+    /// characters in every quarter.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx2_encode_paths() {
+        if !std::is_x86_feature_detected!("avx2") {
+            eprintln!("AVX2 not available; skipped");
+            return;
+        }
+        // Bit i set: character i is 2-byte.
+        let mut patterns = vec![0u16, 0xFFFF, 0x1234, 0xFEDC, 0x8001, 0x7FFE];
+        patterns.extend((1..16).map(|n| n * 0x1111));
+        let mut seed = 0u32;
+        let mut half = |pattern: u16| -> Vec<u16> {
+            (0..16)
+                .map(|i| {
+                    seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                    let r = (seed >> 8) as u16;
+                    if pattern >> i & 1 == 1 {
+                        r % 224
+                    } else {
+                        224 + r % (32768 - 224)
+                    }
+                })
+                .collect()
+        };
+        let halves = || crate::simd::AVX2_ENCODE_HALVES.with(|n| n.get());
+        let before = halves();
+        for &pa in &patterns {
+            for &pb in &patterns {
+                let mut values = half(pa);
+                values.extend(half(pb));
+                let mut data = pack_z15(&values);
+                // One more byte so that the block takes the AVX2 path.
+                data.push(0xA5);
+                let encoded = encode_every_level(&data);
+                assert_eq!(
+                    decode_every_level(&encoded).unwrap(),
+                    data,
+                    "{pa:#x} {pb:#x}"
+                );
+            }
+        }
+        let after = halves();
+        for kind in 0..3 {
+            assert!(
+                after[kind] > before[kind],
+                "kind {kind}: {before:?} {after:?}"
+            );
+        }
     }
 
     /// Packs 15-bit values into bytes, most significant bit first.

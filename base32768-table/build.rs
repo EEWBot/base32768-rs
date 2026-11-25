@@ -151,6 +151,39 @@ fn main() {
         encode_delta[id * 32..id * 32 + 32].copy_from_slice(pat);
     }
 
+    // AVX2 encode: cp = z + 32 * D(z), where D(z) = low + (z >= 0xD40) * 256.
+    // For z < 0xDC0 or z >= 0x7DE0, low is byte z >> 5 & 127 of this table
+    // (8 tables of 16 for vpshufb). Both ranges fit because they share no
+    // index: 0..=109 for z < 0xDC0, 111..=127 for z >= 0x7DE0. Elsewhere low
+    // is 50, 51 or 53.
+    let z15_cps = chars(&z15_blocks);
+    let d_of = |z: u32| -> u32 { (z15_cps[z as usize] >> BLOCK_BITS) - (z >> BLOCK_BITS) };
+    let high = |z: u32| -> u32 { if z >= 0xD40 { 256 } else { 0 } };
+    let mut encode_avx2 = vec![0u8; 128];
+    for t in 0..4u32 {
+        for i in 0..32u32 {
+            let z = match t {
+                0..=2 => t << 10 | i << 5,
+                _ if i < 14 => 0xC00 | i << 5,
+                _ if i >= 15 => 0x7C00 | i << 5,
+                _ => continue,
+            };
+            encode_avx2[(t * 32 + i) as usize] = u8::try_from(d_of(z) - high(z)).unwrap();
+        }
+    }
+    for z in 0..0x8000u32 {
+        let low = if !(0xDC0..0x7DE0).contains(&z) {
+            encode_avx2[((z >> 10).min(3) * 32 + (z >> 5 & 31)) as usize] as u32
+        } else {
+            50 + (z >= 0x2760) as u32 + 2 * (z >= 0x7960) as u32
+        };
+        assert_eq!(
+            z + ((low + high(z)) << BLOCK_BITS),
+            z15_cps[z as usize],
+            "z {z:#x}"
+        );
+    }
+
     // Encode tables: packed UTF-8 for every value.
     let expand =
         |blocks: &[u32]| -> Vec<u32> { chars(blocks).into_iter().map(packed_utf8).collect() };
@@ -216,6 +249,14 @@ fn main() {
         "ENCODE_DELTA",
         "u8",
         &encode_delta,
+    );
+
+    write_array(
+        &mut out,
+        "/// AVX2 encode offsets (see build.rs).",
+        "ENCODE_AVX2",
+        "u8",
+        &encode_avx2,
     );
 
     std::fs::write(
