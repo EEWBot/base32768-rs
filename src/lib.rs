@@ -230,6 +230,16 @@ unsafe fn read_3byte(p: *const u8) -> u32 {
     lookup(((b0 & 0x0F) << 12) | ((b1 & 0x3F) << 6) | (b2 & 0x3F))
 }
 
+/// Decodes a character known to be a 2 byte UTF-8 sequence.
+///
+/// # Safety
+/// `p .. p + 2` must be readable.
+#[inline(always)]
+unsafe fn read_2byte(p: *const u8) -> u32 {
+    let (b0, b1) = unsafe { (*p as u32, *p.add(1) as u32) };
+    lookup(((b0 & 0x1F) << 6) | (b1 & 0x3F))
+}
+
 /// Decodes one character at `p` assuming it is a 2 or 3 byte UTF-8 sequence.
 /// Returns `(value, byte length)`; `value` has `FLAG7` set for anything that is
 /// not a 15-bit character (including invalid lead bytes).
@@ -374,6 +384,10 @@ unsafe fn read_8<const SIMD: bool>(p: *const u8) -> ([u32; 8], usize) {
             if let Some(cps) = simd::code_points_8x3(p) {
                 return (cps.map(|cp| lookup(cp as u32)), 24);
             }
+            // All 2-byte (runs of zero bytes in the input data).
+            if let Some(cps) = simd::code_points_8x2(p) {
+                return (cps.map(|cp| lookup(cp as u32)), 16);
+            }
         } else {
             // Common case (~95% of blocks for random data, since 99.3% of
             // 15-bit characters are 3 bytes): eight 3-byte characters at
@@ -384,6 +398,11 @@ unsafe fn read_8<const SIMD: bool>(p: *const u8) -> ([u32; 8], usize) {
             let or = l.iter().fold(0, |a, &b| a | b);
             if and >= 0xE0 && or <= 0xEF {
                 return (core::array::from_fn(|i| read_3byte(p.add(3 * i))), 24);
+            }
+            // All 2-byte (runs of zero bytes in the input data).
+            let l: [u8; 8] = core::array::from_fn(|i| *p.add(2 * i));
+            if l.iter().all(|&b| b & 0xE0 == 0xC0) {
+                return (core::array::from_fn(|i| read_2byte(p.add(2 * i))), 16);
             }
         }
         read_8_chained(p)
@@ -563,6 +582,18 @@ mod simd {
         static SHR: [u16; 32] = unpack_shift(true);
         static OUT0: [u8; 64] = utf8_idx(0);
         static OUT1: [u8; 64] = utf8_idx(1);
+        /// (b1, b2) of each of 32 characters.
+        const fn utf8_idx2() -> [u8; 64] {
+            let mut m = [0u8; 64];
+            let mut k = 0;
+            while k < 32 {
+                m[2 * k] = (2 * k + 1) as u8;
+                m[2 * k + 1] = (64 + 2 * k) as u8;
+                k += 1;
+            }
+            m
+        }
+        static OUT2: [u8; 64] = utf8_idx2();
         static DESC: [u16; 32] = table::ENCODE_DESC;
         static DELTA: [u8; 256] = table::ENCODE_DELTA;
         // SAFETY: each load reads 64 bytes from a table at least that long.
@@ -627,6 +658,14 @@ mod simd {
             return 96;
         }
         core::hint::cold_path();
+        // All 2-byte (runs of zero bytes in the input data): a fixed shuffle
+        // drops the leading zeros.
+        if two == u32::MAX {
+            let out = _mm512_permutex2var_epi8(pair, ld(OUT2.as_ptr()), b2);
+            // SAFETY: 64 of the 96 bytes the caller guarantees.
+            unsafe { _mm512_storeu_si512(d.cast(), out) };
+            return 64;
+        }
         // Squeeze out the zero bytes, but only in a 16-character half that has
         // a 2-byte character: vpcompressb is slow.
         let half = |out: __m512i, has_two: bool| -> (usize, __m512i) {
@@ -860,6 +899,54 @@ mod simd {
         Some(out)
     }
 
+    /// Code points of eight 2-byte characters at `p .. p + 16`, or `None` if
+    /// any lead byte is not a 2-byte lead (0xC0..=0xDF). Needs only SSE2,
+    /// which every x86-64 CPU has.
+    #[cfg(target_arch = "x86_64")]
+    #[inline]
+    pub unsafe fn code_points_8x2(p: *const u8) -> Option<[u16; 8]> {
+        use core::arch::x86_64::*;
+        // SAFETY: the caller guarantees `p .. p + 16` is readable; `out` is 16 bytes.
+        unsafe {
+            let v = _mm_loadu_si128(p.cast());
+            let lead = _mm_and_si128(v, _mm_set1_epi16(0xE0));
+            if _mm_movemask_epi8(_mm_cmpeq_epi16(lead, _mm_set1_epi16(0xC0))) != 0xFFFF {
+                return None;
+            }
+            let cp = _mm_or_si128(
+                _mm_slli_epi16::<6>(_mm_and_si128(v, _mm_set1_epi16(0x1F))),
+                _mm_and_si128(_mm_srli_epi16::<8>(v), _mm_set1_epi16(0x3F)),
+            );
+            let mut out = [0u16; 8];
+            _mm_storeu_si128(out.as_mut_ptr().cast(), cp);
+            Some(out)
+        }
+    }
+
+    /// See the x86-64 version. Little-endian only: the u16 lanes hold the
+    /// lead byte in their low half.
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    #[target_feature(enable = "neon")]
+    #[inline]
+    pub unsafe fn code_points_8x2(p: *const u8) -> Option<[u16; 8]> {
+        use core::arch::aarch64::*;
+        // SAFETY: the caller guarantees `p .. p + 16` is readable; `out` is 16 bytes.
+        unsafe {
+            let v = vreinterpretq_u16_u8(vld1q_u8(p));
+            let lead = vandq_u16(v, vdupq_n_u16(0xE0));
+            if vminvq_u16(vceqq_u16(lead, vdupq_n_u16(0xC0))) == 0 {
+                return None;
+            }
+            let cp = vorrq_u16(
+                vshlq_n_u16::<6>(vandq_u16(v, vdupq_n_u16(0x1F))),
+                vandq_u16(vshrq_n_u16::<8>(v), vdupq_n_u16(0x3F)),
+            );
+            let mut out = [0u16; 8];
+            vst1q_u16(out.as_mut_ptr(), cp);
+            Some(out)
+        }
+    }
+
     // `vzip` of the low and high bytes builds u16 lanes, which assumes
     // little-endian lanes.
     #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
@@ -910,6 +997,16 @@ mod simd {
     )))]
     #[inline(always)]
     pub unsafe fn code_points_8x3(_p: *const u8) -> Option<[u16; 8]> {
+        None
+    }
+
+    /// Never called, as above.
+    #[cfg(not(any(
+        target_arch = "x86_64",
+        all(target_arch = "aarch64", target_endian = "little")
+    )))]
+    #[inline(always)]
+    pub unsafe fn code_points_8x2(_p: *const u8) -> Option<[u16; 8]> {
         None
     }
 }
@@ -963,6 +1060,68 @@ mod tests {
                 decode_every_level(&encoded).unwrap(),
                 &data[..n],
                 "length {n}"
+            );
+        }
+    }
+
+    /// Blocks of eight 2-byte characters: all-zero and mostly-zero data, and
+    /// a 7-bit or invalid character at each position of a 2-byte run.
+    #[test]
+    fn two_byte_blocks() {
+        for n in 0..400 {
+            let zeros = vec![0u8; n];
+            let encoded = encode_every_level(&zeros);
+            assert_eq!(decode_every_level(&encoded).unwrap(), zeros, "zeros {n}");
+            let sparse: Vec<u8> = (0..n)
+                .map(|i| if i % 37 == 5 { (i * 151) as u8 | 1 } else { 0 })
+                .collect();
+            let encoded = encode_every_level(&sparse);
+            assert_eq!(decode_every_level(&encoded).unwrap(), sparse, "sparse {n}");
+        }
+
+        let zeros: Vec<char> = encode_every_level(&[0; 150]).chars().collect();
+        assert_eq!(zeros.len(), 80);
+        for i in 0..zeros.len() {
+            // U+0180 is a 7-bit character, U+0100 is not in the repertoire;
+            // both are 2 bytes, so the block still looks all 2-byte.
+            for (c, ok) in [('\u{180}', false), ('\u{100}', false), ('\u{4A1}', true)] {
+                let mut chars = zeros.clone();
+                chars[i] = c;
+                let s: String = chars.into_iter().collect();
+                let r = decode_every_level(&s);
+                assert_eq!(r.is_ok(), ok || (c == '\u{180}' && i == 79), "{i} {c:?}");
+            }
+        }
+    }
+
+    /// `simd::code_points_8x2` against the code points of every 2-byte
+    /// character in every lane, and rejection of a 1- or 3-byte character.
+    /// (A wrong code point would only send decode to the slow path, which
+    /// the round trip tests cannot see.)
+    #[cfg(any(
+        target_arch = "x86_64",
+        all(target_arch = "aarch64", target_endian = "little")
+    ))]
+    #[test]
+    fn code_points_8x2_every_char() {
+        let chars: Vec<char> = (0x80..0x800u32)
+            .map(|cp| char::from_u32(cp).unwrap())
+            .collect();
+        for (k, w) in chars.windows(8).enumerate().step_by(3) {
+            let s: String = w.iter().collect();
+            // SAFETY: `s` is 16 bytes.
+            let cps = unsafe { crate::simd::code_points_8x2(s.as_ptr()) };
+            assert_eq!(cps, Some(core::array::from_fn(|i| w[i] as u16)), "{k}");
+        }
+        for (i, c) in [(0, 'a'), (3, '\u{3000}'), (7, '\u{800}')] {
+            let mut w = ['\u{4A0}'; 8];
+            w[i] = c;
+            let s: String = w.iter().collect::<String>() + "xxxxxxxx";
+            // SAFETY: `s` is at least 16 bytes.
+            assert_eq!(
+                unsafe { crate::simd::code_points_8x2(s.as_ptr()) },
+                None,
+                "{c:?}"
             );
         }
     }
@@ -1305,7 +1464,13 @@ mod tests {
             .enumerate()
             .map(|(i, &b)| if i % 23 < 4 { 0 } else { b })
             .collect();
-        for data in [&random, &mixed] {
+        // Runs of zeros give blocks of eight 2-byte characters.
+        let sparse: Vec<u8> = random
+            .iter()
+            .enumerate()
+            .map(|(i, &b)| if i % 64 == 0 { b } else { 0 })
+            .collect();
+        for data in [&random, &mixed, &sparse, &vec![0; 600]] {
             for n in 0..=data.len() {
                 let encoded = encode_at_end(&data[..n]);
                 assert_eq!(decode_at_end(&encoded).unwrap(), &data[..n], "{n}");
