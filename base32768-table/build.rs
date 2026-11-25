@@ -232,6 +232,16 @@ fn main() {
         }
     }
 
+    // AVX-512 decode of 2-byte characters: the 224 2-byte 15-bit characters
+    // (z < 224) are the first 7 blocks, all below U+0800. Indexed by cp >> 5
+    // (a 2-byte code point has 11 bits): the block's index, or 0x80.
+    let mut decode_2byte_block = vec![0x80u8; 64];
+    for (k, &blk) in z15_blocks.iter().enumerate().take(7) {
+        assert!(blk < 0x800);
+        decode_2byte_block[(blk >> BLOCK_BITS) as usize] = k as u8;
+    }
+    assert!(z15_blocks[7] >= 0x800);
+
     // Encode tables: packed UTF-8 for every value.
     let expand =
         |blocks: &[u32]| -> Vec<u32> { chars(blocks).into_iter().map(packed_utf8).collect() };
@@ -304,6 +314,14 @@ fn main() {
         "BASE_OFFSET_BIASED",
         "u16",
         &base_offset_biased,
+    );
+
+    write_array(
+        &mut out,
+        "/// AVX-512 decode: 2-byte 15-bit block index (0..7) of cp >> 5, or 0x80.",
+        "DECODE_2BYTE_BLOCK",
+        "u8",
+        &decode_2byte_block,
     );
 
     std::fs::write(
