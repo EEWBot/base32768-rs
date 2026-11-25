@@ -98,15 +98,36 @@ fn decoded_capacity(len: usize) -> usize {
     chars / 8 * 15 + chars % 8 * 15 / 8 + 1
 }
 
+/// Encodes `b` as a new `String`.
 pub fn encode(b: &[u8]) -> String {
     encode_impl::<LEVEL_AVX512>(b)
 }
 
-/// Encodes with fast paths up to `LEVEL` (see [`LEVEL_SCALAR`]). Only
-/// `LEVEL_AVX512` adds one; below it the scalar path is used.
+/// Appends the encoding of `b` to `out`, reusing its allocation when it has
+/// room for about `b.len() * 8 / 5 + 4` more bytes.
+pub fn encode_into(b: &[u8], out: &mut String) {
+    // SAFETY: `encode_append` appends only well-formed UTF-8.
+    encode_append::<LEVEL_AVX512>(b, unsafe { out.as_mut_vec() });
+}
+
+/// [`encode_append`] into a new `String`.
 fn encode_impl<const LEVEL: u8>(b: &[u8]) -> String {
-    let mut out: Vec<u8> = Vec::with_capacity(encoded_capacity(b.len()));
-    let dst = out.as_mut_ptr();
+    // Sized up front: `reserve` on an empty `Vec` takes the slower growth path
+    // (3-6 ns more for short inputs).
+    let mut out = Vec::with_capacity(encoded_capacity(b.len()));
+    encode_append::<LEVEL>(b, &mut out);
+    // SAFETY: `encode_append` appends only well-formed UTF-8.
+    unsafe { String::from_utf8_unchecked(out) }
+}
+
+/// Appends the encoding of `b` to `out` as UTF-8, with fast paths up to
+/// `LEVEL` (see [`LEVEL_SCALAR`]).
+#[inline(always)]
+fn encode_append<const LEVEL: u8>(b: &[u8], out: &mut Vec<u8>) {
+    let start = out.len();
+    out.reserve(encoded_capacity(b.len()));
+    // SAFETY: `start <= capacity`; the reserved bytes follow.
+    let dst = unsafe { out.as_mut_ptr().add(start) };
     #[allow(unused_mut)]
     let mut pos = 0usize;
     #[allow(unused_mut)]
@@ -234,13 +255,10 @@ fn encode_impl<const LEVEL: u8>(b: &[u8]) -> String {
         pos = unsafe { put(dst, pos, packed) };
     }
 
-    debug_assert!(pos < out.capacity());
-    // SAFETY: `pos` bytes were initialised by `put`; every character is a
-    // well-formed 2 or 3 byte UTF-8 sequence taken from the tables.
-    unsafe {
-        out.set_len(pos);
-        String::from_utf8_unchecked(out)
-    }
+    debug_assert!(start + pos < out.capacity());
+    // SAFETY: `pos` bytes after `start` were initialised by `put`; every
+    // character is a well-formed 2 or 3 byte UTF-8 sequence from the tables.
+    unsafe { out.set_len(start + pos) };
 }
 
 // ---------------------------------------------------------------------------
@@ -296,8 +314,16 @@ unsafe fn read_z15(p: *const u8) -> (u32, usize) {
     (v, 2 + three as usize)
 }
 
+/// Decodes `s` into a new `Vec`.
 pub fn decode(s: &str) -> Result<Vec<u8>, DecodeError> {
     decode_impl::<LEVEL_AVX512>(s)
+}
+
+/// Appends the decoding of `s` to `out`, reusing its allocation when it has
+/// room for about `s.len() * 15 / 16 + 1` more bytes. On error `out` is left
+/// as it was (its capacity may have grown).
+pub fn decode_into(s: &str, out: &mut Vec<u8>) -> Result<(), DecodeError> {
+    decode_append::<LEVEL_AVX512>(s, out)
 }
 
 // The widest fast path `decode_impl` may use. Each level falls back to the one
@@ -319,11 +345,34 @@ const LEVEL_SIMD: u8 = 1;
 /// AVX-512 (BW, VBMI, BITALG) on x86-64.
 const LEVEL_AVX512: u8 = 2;
 
+/// [`decode_append`] into a new `Vec`.
 #[inline(always)]
 fn decode_impl<const LEVEL: u8>(s: &str) -> Result<Vec<u8>, DecodeError> {
+    // Sized up front, as in `encode_impl`.
+    let mut out = Vec::with_capacity(decoded_capacity(s.len()));
+    decode_append::<LEVEL>(s, &mut out)?;
+    Ok(out)
+}
+
+/// Appends the decoding of `s` to `out`; on error, truncates `out` back to
+/// its original length.
+#[inline(always)]
+fn decode_append<const LEVEL: u8>(s: &str, out: &mut Vec<u8>) -> Result<(), DecodeError> {
+    let start = out.len();
+    let r = decode_append_unchecked::<LEVEL>(s, out);
+    if r.is_err() {
+        out.truncate(start);
+    }
+    r
+}
+
+/// Appends the decoding of `s` to `out`, leaving a partial result on error.
+#[inline(always)]
+fn decode_append_unchecked<const LEVEL: u8>(s: &str, out: &mut Vec<u8>) -> Result<(), DecodeError> {
     let bytes = s.as_bytes();
     let len = bytes.len();
-    let mut out: Vec<u8> = Vec::with_capacity(decoded_capacity(len));
+    let start = out.len();
+    out.reserve(decoded_capacity(len));
 
     let mut pos = 0usize;
     let mut char_index = 0usize;
@@ -331,11 +380,12 @@ fn decode_impl<const LEVEL: u8>(s: &str) -> Result<Vec<u8>, DecodeError> {
     // Fast path: 8 characters (120 bits) -> 15 bytes. Bails out to the exact
     // path below on anything other than eight 15-bit characters.
     if len >= 24 {
-        let dst = out.as_mut_ptr();
-        // SAFETY: `out` has the capacity `decode_fast` relies on.
+        // SAFETY: `start <= capacity`; the reserved bytes follow.
+        let dst = unsafe { out.as_mut_ptr().add(start) };
+        // SAFETY: `out` has the capacity `decode_fast` relies on after `start`.
         let (p, written, chars) = unsafe { decode_fast_dispatch::<LEVEL>(bytes, dst) };
-        // SAFETY: `written` bytes were initialised by `decode_fast`.
-        unsafe { out.set_len(written) };
+        // SAFETY: `written` bytes after `start` were initialised by `decode_fast`.
+        unsafe { out.set_len(start + written) };
         pos = p;
         char_index = chars;
     }
@@ -388,7 +438,7 @@ fn decode_impl<const LEVEL: u8>(s: &str) -> Result<Vec<u8>, DecodeError> {
         return Err(DecodeError::PaddingMismatch);
     }
 
-    Ok(out)
+    Ok(())
 }
 
 /// Reads 8 characters of any width (2 or 3 bytes) one after another.
@@ -1359,6 +1409,51 @@ mod tests {
     fn test_encode() {
         let bin = [104, 101, 108, 108, 111, 32, 119, 111, 114, 108, 100];
         assert_eq!(crate::encode(&bin), "媒腻㐤┖ꈳ埳");
+    }
+
+    /// `encode_into` and `decode_into` append to existing contents, reuse a
+    /// buffer with enough capacity, and leave the buffer unchanged on error.
+    #[test]
+    fn into_appends_and_reuses() {
+        use crate::{decode_into, encode_into};
+        let data = random_bytes(5000, 0x9E37_79B9_7F4A_7C15);
+        let mut s = String::from("prefix");
+        let mut bytes = vec![1u8, 2, 3];
+        for n in [0, 1, 14, 15, 16, 29, 30, 59, 60, 61, 95, 96, 97, 1000, 5000] {
+            let d = &data[..n];
+            let expected = crate::encode(d);
+
+            s.truncate(6);
+            encode_into(d, &mut s);
+            assert_eq!(&s[6..], expected, "encode {n}");
+            assert_eq!(&s[..6], "prefix");
+
+            bytes.truncate(3);
+            decode_into(&expected, &mut bytes).unwrap();
+            assert_eq!(&bytes[3..], d, "decode {n}");
+            assert_eq!(&bytes[..3], [1, 2, 3]);
+
+            // A buffer that is already large enough is not reallocated.
+            let (sp, bp) = (s.as_ptr(), bytes.as_ptr());
+            s.truncate(6);
+            encode_into(d, &mut s);
+            bytes.truncate(3);
+            decode_into(&expected, &mut bytes).unwrap();
+            assert_eq!((s.as_ptr(), bytes.as_ptr()), (sp, bp), "realloc {n}");
+        }
+
+        // Errors found after the fast path has written output (4999 bytes end
+        // in a 7-bit character, so a second copy after it is an error).
+        let good = crate::encode(&data[..4999]);
+        for bad in [
+            format!("{good}\u{3000}"),
+            format!("{good}{good}"),
+            format!("{}x", &good[..good.char_indices().last().unwrap().0]),
+        ] {
+            bytes.truncate(3);
+            assert!(decode_into(&bad, &mut bytes).is_err());
+            assert_eq!(bytes, [1, 2, 3]);
+        }
     }
 
     #[test]
