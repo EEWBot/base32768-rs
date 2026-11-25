@@ -1138,7 +1138,9 @@ mod tests {
     #[test]
     fn encode_every_value_every_lane() {
         for lane in 0..32u16 {
-            let values: Vec<u16> = (0..lane).map(|i| 0x7FFF - i).chain(0..32768).collect();
+            let mut values: Vec<u16> = (0..lane).map(|i| 0x7FFF - i).chain(0..32768).collect();
+            // Whole 32-character blocks, so no value is left to the scalar tail.
+            values.resize(values.len().next_multiple_of(32), 0x7FFF);
             let data = pack_z15(&values);
             let encoded = encode_every_level(&data);
             assert_eq!(decode_every_level(&encoded).unwrap(), data, "lane {lane}");
@@ -1205,9 +1207,11 @@ mod tests {
         for shift in 0..32 {
             let mut s: String = std::iter::repeat_n(filler, shift).collect();
             s.extend(&chars);
-            // A multiple of 8 characters is a whole number of bytes with no padding.
+            // Whole 32-character blocks, so every character takes the widest
+            // path; a multiple of 8 characters is also a whole number of bytes
+            // with no padding.
             let n = shift + chars.len();
-            s.extend(std::iter::repeat_n(filler, n.next_multiple_of(8) - n));
+            s.extend(std::iter::repeat_n(filler, n.next_multiple_of(32) - n));
             let decoded = decode_every_level(&s).unwrap();
             assert_eq!(encode_every_level(&decoded), s, "shift {shift}");
         }
