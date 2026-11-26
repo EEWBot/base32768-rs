@@ -176,6 +176,40 @@ fn main() {
         let cp = (z + 0x2000 * (z >= 0xD40) as u32 + (low << BLOCK_BITS)) & 0xFFFF;
         assert_eq!(cp, z15_cps[z as usize], "z {z:#x}");
     }
+    // AVX-512 encode: each slot of the string instead holds the ID of the
+    // full offset cp - z (including the 0x2000 above 0xD40) of the blocks that
+    // use it. Those blocks share one offset, and the IDs index a dictionary
+    // of at most 64 offsets (one two-table vpermi2w).
+    let mut encode_offset_ids = vec![u8::MAX; 128];
+    let mut encode_offset_dict: Vec<u16> = vec![];
+    for z in (0..0x8000u32).step_by(BLOCK_SIZE as usize) {
+        let offset = (z15_cps[z as usize].wrapping_sub(z) & 0xFFFF) as u16;
+        let id = encode_offset_dict
+            .iter()
+            .position(|&x| x == offset)
+            .unwrap_or_else(|| {
+                encode_offset_dict.push(offset);
+                encode_offset_dict.len() - 1
+            }) as u8;
+        let slot = ((encode_start[(z >> 8) as usize] as u32 + (z >> 5 & 0xFF)) & 127) as usize;
+        assert!(
+            encode_offset_ids[slot] == u8::MAX || encode_offset_ids[slot] == id,
+            "slot {slot}"
+        );
+        encode_offset_ids[slot] = id;
+    }
+    assert!(
+        encode_offset_dict.len() <= 64,
+        "{} offsets",
+        encode_offset_dict.len()
+    );
+    encode_offset_dict.resize(64, 0);
+    for z in 0..0x8000u32 {
+        let slot = (encode_start[(z >> 8) as usize] as u32 + (z >> 5 & 0xFF)) & 127;
+        let offset = encode_offset_dict[(encode_offset_ids[slot as usize] & 63) as usize];
+        let cp = (z + offset as u32) & 0xFFFF;
+        assert_eq!(cp, z15_cps[z as usize], "z {z:#x}");
+    }
 
     // AVX-512 decode: z = cp - 32 * (blocks below cp's block that are not
     // 15-bit), which holds because the 15-bit blocks are in ascending order.
@@ -307,17 +341,24 @@ fn main() {
 
     write_array(
         &mut out,
-        "/// AVX-512 encode: per 8-block unit, start in `ENCODE_OFFSET` - 8 * unit (mod 128).",
+        "/// AVX-512 encode: per 8-block unit, start in `ENCODE_OFFSET_IDS` - 8 * unit (mod 128).",
         "ENCODE_START_BIASED",
         "u8",
         &encode_start,
     );
     write_array(
         &mut out,
-        "/// AVX-512 encode: block offsets (see build.rs), shared between units.",
-        "ENCODE_OFFSET",
+        "/// AVX-512 encode: per slot, an `ENCODE_OFFSET_DICT` index (see build.rs).",
+        "ENCODE_OFFSET_IDS",
         "u8",
-        &encode_offset,
+        &encode_offset_ids,
+    );
+    write_array(
+        &mut out,
+        "/// AVX-512 encode: full code point offsets cp - z.",
+        "ENCODE_OFFSET_DICT",
+        "u16",
+        &encode_offset_dict,
     );
     write_array(
         &mut out,

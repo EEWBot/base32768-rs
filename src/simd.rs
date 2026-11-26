@@ -265,10 +265,10 @@ pub unsafe fn encode32_avx2(src: *const u8, d: *mut u8) -> usize {
 /// (64..=96). May write beyond the returned length, but never beyond the
 /// 96 bytes at `d`.
 ///
-/// The code point of a 15-bit value z is
-/// `z + 0x2000 * (z >= 0xD40) + 32 * low`, where `low` depends only on
-/// the block `z >> 5`: byte `(ENCODE_START_BIASED[z >> 8] + (z >> 5)) % 128`
-/// of `ENCODE_OFFSET` (see build.rs).
+/// The code point of a 15-bit value z is `z + offset`, where `offset`
+/// depends only on the block `z >> 5`: entry
+/// `ENCODE_OFFSET_IDS[(ENCODE_START_BIASED[z >> 8] + (z >> 5)) % 128]` of
+/// `ENCODE_OFFSET_DICT` (see build.rs).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw,avx512vbmi,avx512vbmi2,popcnt")]
 #[inline]
@@ -342,11 +342,11 @@ pub unsafe fn encode32_avx512(src: *const u8, d: *mut u8) -> usize {
     }
     static OUT2: [u8; 64] = utf8_idx2();
     static START: [u8; 128] = table::ENCODE_START_BIASED;
-    static OFF: [u8; 128] = table::ENCODE_OFFSET;
+    static IDS: [u8; 128] = table::ENCODE_OFFSET_IDS;
+    static DICT: [u16; 64] = table::ENCODE_OFFSET_DICT;
     // SAFETY: each load reads 64 bytes from a table at least that long.
     let ld = |p: *const u8| unsafe { _mm512_loadu_si512(p.cast()) };
     let w = |x: i16| _mm512_set1_epi16(x);
-    const ODD: u64 = 0xAAAA_AAAA_AAAA_AAAA;
     const M48: u64 = (1 << 48) - 1;
 
     // 60 bytes -> 32 x 15-bit values. The masked load touches only 60 bytes.
@@ -358,16 +358,19 @@ pub unsafe fn encode32_avx512(src: *const u8, d: *mut u8) -> usize {
         w(0x7FFF),
     );
 
-    // z -> code point, in the high byte of each u16 lane: vpermi2b uses
+    // z -> code point, from the high byte of each u16 lane: vpermi2b uses
     // the low 7 bits of each index byte, z >> 8 (the unit) for the start,
-    // then start + (z >> 5) % 256 for `low`. The low bytes are ignored and
-    // zeroed.
-    let hi = _mm512_cmpge_epu16_mask(z, w(0x0D40));
-    let z_adj = _mm512_mask_add_epi16(z, hi, z, w(0x2000));
+    // then start + (z >> 5) % 256 for the offset ID. vpermi2w uses its low
+    // 6 bits. The low bytes are ignored.
     let start = _mm512_permutex2var_epi8(ld(START.as_ptr()), z, ld(START[64..].as_ptr()));
     let idx = _mm512_add_epi8(start, _mm512_slli_epi16::<3>(z));
-    let low_hi = _mm512_maskz_permutex2var_epi8(ODD, ld(OFF.as_ptr()), idx, ld(OFF[64..].as_ptr()));
-    let cp = _mm512_add_epi16(z_adj, _mm512_srli_epi16::<3>(low_hi));
+    let ids = _mm512_permutex2var_epi8(ld(IDS.as_ptr()), idx, ld(IDS[64..].as_ptr()));
+    let offset = _mm512_permutex2var_epi16(
+        ld(DICT.as_ptr().cast()),
+        _mm512_srli_epi16::<8>(ids),
+        ld(DICT[32..].as_ptr().cast()),
+    );
+    let cp = _mm512_add_epi16(z, offset);
 
     // UTF-8 as 3 bytes per character; 2-byte characters get a leading 0,
     // the only zero byte (every other byte has its top bit set).
