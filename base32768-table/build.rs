@@ -294,6 +294,19 @@ fn main() {
     let z15_utf8 = expand(&z15_blocks);
     let z7_utf8 = expand(&z7_blocks);
 
+    // AVX-512 encode of blocks of 2-byte characters (z < 224, the first 7
+    // blocks): the UTF-8 bytes (b0, b1) of a block's first character as a
+    // little-endian u16. Within a block only the low 5 bits of b1 change,
+    // and they equal those of z.
+    let mut encode_2byte_prefix = vec![0u16; 8];
+    for (i, prefix) in encode_2byte_prefix.iter_mut().take(7).enumerate() {
+        *prefix = z15_utf8[i << BLOCK_BITS] as u16;
+    }
+    for z in 0..224 {
+        let packed = encode_2byte_prefix[z >> BLOCK_BITS] as u32 | ((z as u32 & 31) << 8);
+        assert_eq!(packed | 2 << 24, z15_utf8[z], "z {z}");
+    }
+
     // Large tables are emitted as `static` so each exists exactly once in the binary.
     let mut out = String::new();
     write_array(
@@ -359,6 +372,13 @@ fn main() {
         "ENCODE_OFFSET_DICT",
         "u16",
         &encode_offset_dict,
+    );
+    write_array(
+        &mut out,
+        "/// AVX-512 encode: UTF-8 (b0, b1) of the first character of each 2-byte block.",
+        "ENCODE_2BYTE_PREFIX",
+        "u16",
+        &encode_2byte_prefix,
     );
     write_array(
         &mut out,

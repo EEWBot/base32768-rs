@@ -329,21 +329,10 @@ pub unsafe fn encode32_avx512(src: *const u8, d: *mut u8) -> usize {
     static UTF8_BITS: [u8; 64] = utf8_bits();
     static OUT0: [u8; 64] = utf8_idx(0);
     static OUT1: [u8; 64] = utf8_idx(1);
-    /// (b1, b2) of each of 32 characters.
-    const fn utf8_idx2() -> [u8; 64] {
-        let mut m = [0u8; 64];
-        let mut k = 0;
-        while k < 32 {
-            m[2 * k] = (2 * k + 1) as u8;
-            m[2 * k + 1] = (64 + 2 * k) as u8;
-            k += 1;
-        }
-        m
-    }
-    static OUT2: [u8; 64] = utf8_idx2();
     static START: [u8; 128] = table::ENCODE_START_BIASED;
     static IDS: [u8; 128] = table::ENCODE_OFFSET_IDS;
     static DICT: [u16; 64] = table::ENCODE_OFFSET_DICT;
+    static PREFIX: [u16; 8] = table::ENCODE_2BYTE_PREFIX;
     // SAFETY: each load reads 64 bytes from a table at least that long.
     let ld = |p: *const u8| unsafe { _mm512_loadu_si512(p.cast()) };
     let w = |x: i16| _mm512_set1_epi16(x);
@@ -357,6 +346,23 @@ pub unsafe fn encode32_avx512(src: *const u8, d: *mut u8) -> usize {
         _mm512_multishift_epi64_epi8(ld(BITS.as_ptr()), input),
         w(0x7FFF),
     );
+
+    // All 2-byte (runs of zero bytes in the input data): the first 7 blocks
+    // of z. Each character is its block's (b0, b1) with the low 5 bits of z
+    // in b1, which needs no code point.
+    let two = _mm512_cmplt_epu16_mask(z, w(224));
+    if two == u32::MAX {
+        // SAFETY: PREFIX has 16 bytes.
+        let lane = unsafe { _mm_loadu_si128(PREFIX.as_ptr().cast()) };
+        let prefix =
+            _mm512_permutexvar_epi16(_mm512_srli_epi16::<5>(z), _mm512_broadcast_i32x4(lane));
+        let out = _mm512_ternarylogic_epi32::<0xF8>(prefix, _mm512_slli_epi16::<8>(z), w(0x1F00));
+        // SAFETY: 64 of the 96 bytes the caller guarantees.
+        unsafe { _mm512_storeu_si512(d.cast(), out) };
+        #[cfg(test)]
+        AVX512_ENCODE_BLOCKS.with(|n| n.set(n.get() + 1));
+        return 64;
+    }
 
     // z -> code point, from the high byte of each u16 lane: vpermi2b uses
     // the low 7 bits of each index byte, z >> 8 (the unit) for the start,
@@ -374,9 +380,7 @@ pub unsafe fn encode32_avx512(src: *const u8, d: *mut u8) -> usize {
 
     // UTF-8 as 3 bytes per character; 2-byte characters get a leading 0,
     // the only zero byte (every other byte has its top bit set).
-    // Only the first seven 32-character blocks use two bytes. Their
-    // code points also have zero in bits 12..15.
-    let two = _mm512_cmplt_epu16_mask(z, w(224));
+    // 2-byte code points have zero in bits 12..15.
     let headers = _mm512_mask_blend_epi16(two, w(0x80E0u16 as i16), w(0xC000u16 as i16));
     let bits = _mm512_multishift_epi64_epi8(ld(UTF8_BITS.as_ptr()), cp);
     let pair = _mm512_ternarylogic_epi32::<0xF8>(headers, bits, w(0x3F0F));
@@ -397,14 +401,6 @@ pub unsafe fn encode32_avx512(src: *const u8, d: *mut u8) -> usize {
         return 96;
     }
     core::hint::cold_path();
-    // All 2-byte (runs of zero bytes in the input data): a fixed shuffle
-    // drops the leading zeros.
-    if two == u32::MAX {
-        let out = _mm512_permutex2var_epi8(pair, ld(OUT2.as_ptr()), b2);
-        // SAFETY: 64 of the 96 bytes the caller guarantees.
-        unsafe { _mm512_storeu_si512(d.cast(), out) };
-        return 64;
-    }
     // For a mixed block, each half may write all 48 bytes: the next
     // half or block overwrites the spare bytes, within the reserved 96.
     let compress = |out| {
