@@ -211,35 +211,30 @@ fn main() {
     for h in 0..128 {
         half_desc_biased[(h + 0x10) & 127] = half_desc[h];
     }
-    let mut valid_mask = vec![0u16; 32];
-    let mut base_offset_biased = vec![0u16; 32];
-    for (i, &(mask, offset)) in entries.iter().enumerate() {
-        valid_mask[i] = mask;
-        base_offset_biased[i] = offset.wrapping_add(0x2000);
-    }
     // Counting missing blocks from the current block through the end of
     // its half page lets decode use the shifted mask for both membership
     // (bit zero) and rank (population count).
-    let missing_mask: Vec<_> = valid_mask.iter().map(|mask| !mask).collect();
-    let end_offset: Vec<_> = base_offset_biased
+    // Padded to 32 `vpermw` entries with half pages that have no 15-bit
+    // blocks.
+    entries.resize(32, (0, 0));
+    let missing_mask: Vec<_> = entries.iter().map(|&(mask, _)| !mask).collect();
+    // 32 * non-15-bit blocks through the end of the half page, + 0x2000.
+    let end_offset: Vec<_> = entries
         .iter()
-        .zip(&missing_mask)
-        .map(|(base, mask)| base.wrapping_add(32 * mask.count_ones() as u16))
+        .map(|&(mask, offset)| {
+            offset
+                .wrapping_add(0x2000)
+                .wrapping_add(32 * (16 - mask.count_ones()) as u16)
+        })
         .collect();
     for cp in 0x800..0x10000u32 {
         let (b0, b1) = (0xE0 | cp >> 12, 0x80 | (cp >> 6 & 0x3F));
         let t = 64 * b0 + b1;
         let i = half_desc_biased[(t >> 3 & 127) as usize] as usize;
         let cp_adj = (t << 6 | (cp & 0x3F)) & 0xFFFF;
-        let bit = 1u32 << (cp_adj >> 5 & 15);
-        let mask = valid_mask[i] as u32;
-        assert_eq!(mask & bit != 0, decode[cp as usize] < 0x8000, "U+{cp:04X}");
-        if mask & bit != 0 {
-            let holes = (!mask & (bit - 1)).count_ones();
-            let z = cp_adj.wrapping_sub(base_offset_biased[i] as u32 + (holes << 5)) & 0xFFFF;
-            assert_eq!(z, decode[cp as usize] as u32, "U+{cp:04X}");
-            let suffix = missing_mask[i] >> bit.trailing_zeros();
-            assert_eq!(suffix & 1, 0);
+        let suffix = missing_mask[i] >> (cp_adj >> 5 & 15);
+        assert_eq!(suffix & 1 == 0, decode[cp as usize] < 0x8000, "U+{cp:04X}");
+        if suffix & 1 == 0 {
             let z = cp_adj
                 .wrapping_sub(end_offset[i] as u32)
                 .wrapping_add(32 * suffix.count_ones())
@@ -320,22 +315,7 @@ fn main() {
     );
     write_array(
         &mut out,
-        "/// AVX-512 decode: bitmap of a half page's 15-bit blocks, per entry.",
-        "VALID_MASK",
-        "u16",
-        &valid_mask,
-    );
-    write_array(
-        &mut out,
-        "/// AVX-512 decode: 32 * non-15-bit blocks before the half page, + 0x2000.",
-        "BASE_OFFSET_BIASED",
-        "u16",
-        &base_offset_biased,
-    );
-
-    write_array(
-        &mut out,
-        "/// AVX-512 decode: 2-byte 15-bit block index (0..7) of cp >> 5, or 0x80.",
+        "/// AVX-512 decode: 32 * the 2-byte 15-bit block index (0..=192) of cp >> 5, or 0xFF.",
         "DECODE_2BYTE_BLOCK",
         "u8",
         &decode_2byte_block,

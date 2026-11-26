@@ -929,8 +929,9 @@ mod simd {
     }
 
     /// Encodes the 60 bytes at `src` as 32 characters at `d`, with table
-    /// lookups only in registers, and returns the number of bytes written
-    /// (64..=96). May write up to 96 bytes.
+    /// lookups only in registers, and returns the number of bytes produced
+    /// (64..=96). May write beyond the returned length, but never beyond the
+    /// 96 bytes at `d`.
     ///
     /// The code point of a 15-bit value z is
     /// `z + 0x2000 * (z >= 0xD40) + 32 * low`, where `low` depends only on
@@ -2166,23 +2167,26 @@ mod tests {
     /// scalar code as there, agree with `DECODE` for every 3-byte code point.
     #[test]
     fn half_page_tables_match_decode_table() {
-        use crate::table::{BASE_OFFSET_BIASED, DECODE, HALF_DESC_BIASED, VALID_MASK};
+        use crate::table::{DECODE, END_OFFSET_BIASED, HALF_DESC_BIASED, MISSING_MASK};
         for cp in 0x800..=0xFFFFu32 {
             let t = 64 * (0xE0 | cp >> 12) + (0x80 | (cp >> 6 & 0x3F));
             let entry = HALF_DESC_BIASED[(t >> 3 & 127) as usize] as usize;
             let cp_adj = (t << 6 | (cp & 0x3F)) & 0xFFFF;
-            let mask = VALID_MASK[entry] as u32;
-            let bit = 1 << (cp_adj >> 5 & 15);
+            // vpshrdvw with zero: missing blocks from this one through the
+            // end of the half page.
+            let missing = MISSING_MASK[entry] as u32 >> (cp_adj >> 5 & 15);
             let expected = DECODE[cp as usize];
-            if mask & bit == 0 {
+            if missing & 1 != 0 {
                 assert!(
                     expected >= 0x8000,
-                    "U+{cp:04X} should be a 15-bit character"
+                    "U+{cp:04X} should not be a 15-bit character"
                 );
                 continue;
             }
-            let holes = (!mask & (bit - 1)).count_ones();
-            let z = cp_adj.wrapping_sub(BASE_OFFSET_BIASED[entry] as u32 + 32 * holes) & 0xFFFF;
+            let z = cp_adj
+                .wrapping_sub(END_OFFSET_BIASED[entry] as u32)
+                .wrapping_add(32 * missing.count_ones())
+                & 0xFFFF;
             assert_eq!(z, expected as u32, "U+{cp:04X}");
         }
     }
