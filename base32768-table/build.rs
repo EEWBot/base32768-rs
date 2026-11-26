@@ -276,6 +276,19 @@ fn main() {
         "u32",
         &z7_utf8,
     );
+    // The same characters as `char`s, for the safe-only implementation.
+    for (name, bits, cps) in [
+        ("Z15_CHAR", 15, &z15_cps),
+        ("Z7_CHAR", 7, &chars(&z7_blocks)),
+    ] {
+        writeln!(out, "/// The character for each {bits}-bit value.").unwrap();
+        writeln!(out, "pub static {name}: [char; {}] = [", cps.len()).unwrap();
+        for chunk in cps.chunks(16) {
+            let line: Vec<String> = chunk.iter().map(|cp| format!("'\\u{{{cp:x}}}'")).collect();
+            writeln!(out, "    {},", line.join(", ")).unwrap();
+        }
+        writeln!(out, "];").unwrap();
+    }
     write_array(
         &mut out,
         "/// Code point (U+0000..=U+FFFF) -> 0xFFFF (invalid), `0x8000 | z` (7-bit) or `z` (15-bit).",
