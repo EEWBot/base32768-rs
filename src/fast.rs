@@ -200,9 +200,15 @@ fn encode_append<const LEVEL: u8>(b: &[u8], out: &mut Vec<u8>) {
         unsafe fn encode_neon_dense(b: &[u8], dst: *mut u8) -> (usize, usize) {
             let (mut done, mut pos) = (0, 0);
             while done + 32 <= b.len() {
-                let mut zs = [0u16; 16];
                 // SAFETY: 32 bytes are readable at `done`, and the 30 bytes
                 // encoded reserve 16 * 3 = 48 output bytes.
+                if unsafe { simd::encode16_2byte_short_neon(b.as_ptr().add(done), dst.add(pos)) } {
+                    pos += 32;
+                    done += 30;
+                    continue;
+                }
+                let mut zs = [0u16; 16];
+                // SAFETY: as above.
                 let n = unsafe {
                     simd::encode16_2byte_neon(b.as_ptr().add(done), dst.add(pos), zs.as_mut_ptr())
                 };
@@ -1188,6 +1194,35 @@ mod tests {
                 let c = s[i..].chars().next().unwrap();
                 let t = format!("{}{bad}{}", &s[..i], &s[i + c.len_utf8()..]);
                 let _ = decode_every_level(&t);
+            }
+        }
+    }
+
+    /// Long inputs of mostly 2-byte characters (values below 224, not only
+    /// zeros), with values of 224 and above (3-byte characters, including
+    /// ones that differ from a 2-byte value in one bit) at every position:
+    /// every level agrees.
+    #[test]
+    fn two_byte_values_with_3byte_at_every_position() {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let base: Vec<u16> = (0..1600).map(|_| (next() % 224) as u16).collect();
+        let encoded = encode_every_level(&pack_z15(&base));
+        assert_eq!(decode_every_level(&encoded).unwrap(), pack_z15(&base));
+        for i in 0..64 {
+            for big in [224, 255, 256, 1 << (i % 15), 0x7FFF] {
+                let mut values = base.clone();
+                values[100 + i] = big.max(224);
+                let data = pack_z15(&values);
+                assert_eq!(
+                    decode_every_level(&encode_every_level(&data)).unwrap(),
+                    data
+                );
             }
         }
     }

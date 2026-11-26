@@ -1047,6 +1047,75 @@ pub unsafe fn code_points_8x3(p: *const u8) -> Option<[u16; 8]> {
     Some(out)
 }
 
+/// Encodes the 30 bytes at `src` (31 are read) as 16 characters at `d` if
+/// all of them are 2-byte characters, and returns whether it did (nothing
+/// is written otherwise). Works on bytes only: the low 8 bits of value i of
+/// each 15-byte half are byte 2i << (7 - i) | byte 2i + 1 >> (i + 1), and
+/// the value is below 224 if its top 7 bits are zero and its low 8 bits are
+/// below 224.
+#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+#[target_feature(enable = "neon")]
+#[inline]
+pub unsafe fn encode16_2byte_short_neon(src: *const u8, d: *mut u8) -> bool {
+    use crate::table;
+    use core::arch::aarch64::*;
+    /// The bits of a 15-byte half that hold the top 7 bits of a value. Byte
+    /// 15 of the first load is byte 0 of the second, checked there.
+    const fn short_mask() -> [u8; 16] {
+        let mut m = [0u8; 16];
+        let mut i = 0;
+        while i < 8 {
+            let mut k = 0;
+            while k < 7 {
+                let bit = 15 * i + k;
+                m[bit / 8] |= 0x80 >> (bit % 8);
+                k += 1;
+            }
+            i += 1;
+        }
+        m
+    }
+    static SHORT: [u8; 16] = short_mask();
+    static LEFT: [i8; 16] = [7, 6, 5, 4, 3, 2, 1, 0, 7, 6, 5, 4, 3, 2, 1, 0];
+    static RIGHT: [i8; 16] = [
+        -1, -2, -3, -4, -5, -6, -7, -8, -1, -2, -3, -4, -5, -6, -7, -8,
+    ];
+    static PREFIX: [u16; 8] = table::ENCODE_2BYTE_PREFIX;
+    let dup = vdupq_n_u8;
+
+    // SAFETY: the caller guarantees 31 readable bytes at `src`; the tables
+    // are 16 bytes.
+    let (a, b, short, left, right, prefix) = unsafe {
+        (
+            vld1q_u8(src),
+            vld1q_u8(src.add(15)),
+            vld1q_u8(SHORT.as_ptr()),
+            vld1q_s8(LEFT.as_ptr()),
+            vld1q_s8(RIGHT.as_ptr()),
+            vld1q_u8(PREFIX.as_ptr().cast()),
+        )
+    };
+    // Lanes 0..8 from the first half, 8..16 from the second.
+    let even = vuzp1q_u8(a, b);
+    let odd = vuzp2q_u8(a, b);
+    let z8 = vorrq_u8(vshlq_u8(even, left), vshlq_u8(odd, right));
+    let bad = vorrq_u8(vandq_u8(vorrq_u8(a, b), short), vcgeq_u8(z8, dup(224)));
+    if vmaxvq_u8(bad) != 0 {
+        return false;
+    }
+    let pair = vshlq_n_u8::<1>(vshrq_n_u8::<5>(z8));
+    let b0 = vqtbl1q_u8(prefix, pair);
+    let b1 = vorrq_u8(
+        vqtbl1q_u8(prefix, vorrq_u8(pair, dup(1))),
+        vandq_u8(z8, dup(31)),
+    );
+    // SAFETY: the caller guarantees 32 writable bytes at `d`.
+    unsafe { vst2q_u8(d, uint8x16x2_t(b0, b1)) };
+    #[cfg(test)]
+    NEON_ENCODE_WINDOWS.with(|n| n.set(n.get() + 1));
+    true
+}
+
 /// Encodes the 30 bytes at `src` (32 are read) as 16 characters at `d` if
 /// all of them are 2-byte characters, and returns 32 (the bytes written).
 /// Otherwise writes nothing, stores the 16 values at `zs` and returns 0.
