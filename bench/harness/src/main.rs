@@ -67,8 +67,21 @@ fn main() {
         random.iter().map(|&b| { st ^= st << 13; st ^= st >> 7; st ^= st << 17; if (st >> 40) & ((1 << shift) - 1) == 0 { 0 } else { b } }).collect()
     };
     let (irr4, irr2) = (irregular(2), irregular(1));
-    let inputs: [(&str, &Vec<u8>); 9] =
-        [("10 KB", &ten_kb), ("1 MB ramp", &ramp), ("1 MB random", &random), ("1 MB zeros/64B", &z64), ("1 MB zeros/16B", &z16), ("1 MB all zero", &zeros), ("1 MB 1/64 nonzero", &mostly0), ("1 MB 1/4 zero irr", &irr4), ("1 MB 1/2 zero irr", &irr2)];
+    // Random 15-bit values below 224 (every 2-byte character), packed.
+    let mut two = vec![0u8; 1_000_000];
+    let mut st2 = 0x6A09_E667_F3BC_C909u64;
+    for i in 0..1_000_000 * 8 / 15 {
+        st2 ^= st2 << 13; st2 ^= st2 >> 7; st2 ^= st2 << 17;
+        let z = (st2 >> 32) % 224;
+        for k in 0..15 {
+            if z >> (14 - k) & 1 == 1 {
+                let bit = i * 15 + k;
+                two[bit / 8] |= 0x80 >> (bit % 8);
+            }
+        }
+    }
+    let inputs: [(&str, &Vec<u8>); 10] =
+        [("10 KB", &ten_kb), ("1 MB ramp", &ramp), ("1 MB random", &random), ("1 MB zeros/64B", &z64), ("1 MB zeros/16B", &z16), ("1 MB all zero", &zeros), ("1 MB 1/64 nonzero", &mostly0), ("1 MB 1/4 zero irr", &irr4), ("1 MB 1/2 zero irr", &irr2), ("1 MB z<224", &two)];
 
     // Every 15-bit value, at every byte alignment.
     let mut all = vec![0u8; 32768 * 15 / 8];

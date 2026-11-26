@@ -77,6 +77,35 @@ unsafe fn encode_chunk(chunk: &[u8; 15], dst: *mut u8, mut pos: usize) -> usize 
     pos
 }
 
+/// At least 24 of the 32 15-bit values in the 60 bytes are below 224
+/// (2-byte characters).
+#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+#[inline]
+fn two_byte_dense_values(head: &[u8]) -> bool {
+    let (chunks, _) = head.as_chunks::<15>();
+    let count: usize = chunks
+        .iter()
+        .map(|c| {
+            let hi = u64::from_be_bytes(c[0..8].try_into().unwrap());
+            let lo = u64::from_be_bytes(c[7..15].try_into().unwrap());
+            [
+                hi >> 49,
+                hi >> 34,
+                hi >> 19,
+                hi >> 4,
+                lo >> 45,
+                lo >> 30,
+                lo >> 15,
+                lo,
+            ]
+            .iter()
+            .filter(|&&z| z & 0x7FFF < 224)
+            .count()
+        })
+        .sum();
+    count >= 24
+}
+
 /// Returns `x` unchanged. When AVX-512 is enabled at compile time (e.g.
 /// `-C target-cpu=native` on Zen 4/5 or Sapphire Rapids), LLVM turns the eight
 /// table lookups in `encode` into a `vpgatherqd` plus `vpextrd` stores, which
@@ -202,24 +231,39 @@ fn encode_append<const LEVEL: u8>(b: &[u8], out: &mut Vec<u8>) {
         (done, pos) = unsafe { encode_avx2(b, dst, done, pos) };
     }
 
-    // NEON: 30 bytes -> 16 characters when they all have the same length;
-    // otherwise the scalar path below takes the two 15-byte chunks.
+    // NEON: inputs of mostly 2-byte characters (runs of zero bytes), 30
+    // bytes -> 16 characters per window. Other inputs take only the scalar
+    // path, which is faster for 3-byte characters than NEON.
     #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
-    if LEVEL >= LEVEL_SIMD {
-        while done + 32 <= b.len() {
-            // SAFETY: 32 bytes are readable at `done`, and the 30 bytes
-            // encoded reserve 16 * 3 = 48 output bytes, the most written.
-            let n = unsafe { simd::encode16_neon(b.as_ptr().add(done), dst.add(pos)) };
-            if n != 0 {
-                pos += n;
-            } else {
-                for chunk in b[done..done + 30].as_chunks::<15>().0 {
-                    // SAFETY: as in the scalar path below.
-                    pos = unsafe { encode_chunk(chunk, dst, pos) };
+    if LEVEL >= LEVEL_SIMD && b.len() >= 1024 && two_byte_dense_values(&b[..60]) {
+        // In its own function, as for decode.
+        #[inline(never)]
+        unsafe fn encode_neon_dense(b: &[u8], dst: *mut u8) -> (usize, usize) {
+            let (mut done, mut pos) = (0, 0);
+            while done + 32 <= b.len() {
+                let mut zs = [0u16; 16];
+                // SAFETY: 32 bytes are readable at `done`, and the 30 bytes
+                // encoded reserve 16 * 3 = 48 output bytes.
+                let n = unsafe {
+                    simd::encode16_2byte_neon(b.as_ptr().add(done), dst.add(pos), zs.as_mut_ptr())
+                };
+                if n != 0 {
+                    pos += n;
+                } else {
+                    // Some 3-byte characters: the scalar table, from the
+                    // values already unpacked.
+                    for &z in &zs {
+                        // SAFETY: within the 48 bytes reserved, plus the
+                        // spare byte of the characters that follow.
+                        pos = unsafe { put(dst, pos, z15_utf8(z as u32)) };
+                    }
                 }
+                done += 30;
             }
-            done += 30;
+            (done, pos)
         }
+        // SAFETY: see above; `dst` has the capacity for all of `b`.
+        (done, pos) = unsafe { encode_neon_dense(b, dst) };
     }
 
     // Fast path: 15 bytes -> 8 characters.
@@ -564,19 +608,21 @@ unsafe fn decode_fast<const SIMD: bool, const AVX512: bool, const DENSE: bool>(
         }
         #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
         if SIMD && pos + 48 <= len {
-            // 16 three-byte characters, or 16 two-byte ones (runs of zero
-            // bytes) after a 2-byte lead.
+            // 16 three-byte characters, or (in the dense instance only) 16
+            // two-byte ones after a 2-byte lead.
             // SAFETY: `pos + 48 <= len`. Each group consumes at least 16
             // input bytes, which account for its 15 bytes of `dst` capacity;
             // the 16th byte stored is within the capacity of the rest of
             // the 48 bytes.
-            let three = unsafe { *src.add(pos) } >= 0xE0;
-            let groups = if three {
-                0
-            } else {
-                unsafe { simd::decode16_2byte_neon(src.add(pos), dst.add(written)) }
+            let two = DENSE && unsafe { *src.add(pos) } < 0xE0;
+            let groups = unsafe {
+                if two {
+                    simd::decode16_2byte_neon(src.add(pos), dst.add(written))
+                } else {
+                    simd::decode16_neon(src.add(pos), dst.add(written))
+                }
             };
-            let step = if three { 24 } else { 16 };
+            let step = if two { 16 } else { 24 };
             // As for AVX-512, a whole window keeps the next position
             // independent of the vector computation.
             if groups == 2 {
@@ -584,21 +630,9 @@ unsafe fn decode_fast<const SIMD: bool, const AVX512: bool, const DENSE: bool>(
                 written += 30;
                 continue;
             }
+            // The 8-character path below takes the rejected group.
             pos += step * groups;
             written += 15 * groups;
-            // A mix of 2- and 3-byte characters: 8 at a time.
-            // SAFETY: `pos + 32 <= len`: at most 28 bytes are read, and the
-            // 16 or more taken account for 15 of the 16 bytes stored, the
-            // rest of the 32 for the 16th.
-            if pos + 32 <= len {
-                let n = unsafe { simd::decode8_mixed_neon(src.add(pos), dst.add(written)) };
-                if n != 0 {
-                    pos += n;
-                    written += 15;
-                    continue;
-                }
-            }
-            // The 8-character path below takes the rejected group.
         }
         // SAFETY: `pos + 24 <= len`.
         let (v, n) = unsafe { read_8::<SIMD>(src.add(pos)) };
@@ -629,6 +663,14 @@ unsafe fn decode_fast<const SIMD: bool, const AVX512: bool, const DENSE: bool>(
 /// Runs [`decode_fast`] with the best instruction set available.
 ///
 /// # Safety
+/// At least 24 of the 64 bytes are 2-byte UTF-8 leads (runs of zero bytes
+/// in the input data).
+#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+#[inline]
+fn two_byte_dense(head: &[u8]) -> bool {
+    head.iter().filter(|&&b| b & 0xE0 == 0xC0).count() >= 24
+}
+
 /// See [`decode_fast`].
 #[inline(always)]
 unsafe fn decode_fast_dispatch<const LEVEL: u8>(
@@ -707,8 +749,24 @@ unsafe fn decode_fast_dispatch<const LEVEL: u8>(
 
     #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
     if LEVEL >= LEVEL_SIMD {
+        // As for AVX-512, two functions: with the 2-byte path in the same
+        // function, the 3-byte loop is 10-20% slower on random data.
+        #[inline(never)]
+        unsafe fn decode_fast_neon(bytes: &[u8], dst: *mut u8) -> (usize, usize, usize) {
+            unsafe { decode_fast::<true, false, false>(bytes, dst) }
+        }
+        #[inline(never)]
+        unsafe fn decode_fast_neon_dense(bytes: &[u8], dst: *mut u8) -> (usize, usize, usize) {
+            unsafe { decode_fast::<true, false, true>(bytes, dst) }
+        }
         // SAFETY: NEON is part of the aarch64 baseline.
-        return unsafe { decode_fast::<true, false, false>(bytes, dst) };
+        return unsafe {
+            if bytes.len() >= 1024 && two_byte_dense(&bytes[..64]) {
+                decode_fast_neon_dense(bytes, dst)
+            } else {
+                decode_fast_neon(bytes, dst)
+            }
+        };
     }
 
     unsafe { decode_fast::<false, false, false>(bytes, dst) }
@@ -1194,6 +1252,29 @@ mod tests {
                 let t = format!("{}{bad}{}", &s[..i], &s[i + c.len_utf8()..]);
                 let _ = decode_every_level(&t);
             }
+        }
+    }
+
+    /// The NEON paths run: 3-byte decode for random data, and the 2-byte
+    /// decode and encode paths for long inputs of 2-byte characters only.
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    #[test]
+    fn neon_paths_run() {
+        let count = |k: usize| crate::simd::NEON_WINDOWS.with(|n| n[k].get());
+        let random = random_bytes(3000, 0x1234_5678);
+        let encoded = encode_every_level(&random);
+        let before = count(0);
+        assert_eq!(decode_impl::<LEVEL_SIMD>(&encoded).unwrap(), random);
+        assert!(count(0) > before);
+        // 500 bytes encode to 534 bytes, below the 1 KiB the 2-byte paths
+        // need.
+        for (len, used) in [(3000, true), (500, false)] {
+            let zeros = vec![0u8; len];
+            let before = (count(1), count(2));
+            let encoded = encode_impl::<LEVEL_SIMD>(&zeros);
+            assert_eq!(count(2) > before.1, used, "encode {len}");
+            assert_eq!(decode_impl::<LEVEL_SIMD>(&encoded).unwrap(), zeros);
+            assert_eq!(count(1) > before.0, used, "decode {len}");
         }
     }
 

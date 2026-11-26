@@ -849,6 +849,15 @@ pub unsafe fn decode32_2byte_avx512(p: *const u8, d: *mut u8) -> usize {
     groups
 }
 
+#[cfg(all(test, target_arch = "aarch64", target_endian = "little"))]
+thread_local! {
+    /// Number of calls of each NEON path on this thread that decoded or
+    /// encoded a whole window: 3-byte decode, 2-byte decode, 2-byte encode.
+    pub static NEON_WINDOWS: [core::cell::Cell<usize>; 3] = const {
+        [core::cell::Cell::new(0), core::cell::Cell::new(0), core::cell::Cell::new(0)]
+    };
+}
+
 #[cfg(all(test, target_arch = "x86_64"))]
 thread_local! {
     /// Number of 32-character blocks the AVX-512 path decoded on this
@@ -1040,21 +1049,13 @@ pub unsafe fn code_points_8x3(p: *const u8) -> Option<[u16; 8]> {
     Some(out)
 }
 
-/// Whether `encode16_neon` takes blocks of 2-byte characters (else 0).
-#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
-const ENCODE_2BYTE: bool = true;
-
-/// Encodes the 30 bytes at `src` (32 are read) as 16 characters at `d`.
-/// Returns the number of bytes written: 48 if all are 3-byte characters,
-/// 32 if all are 2-byte ones, or 0 (nothing written) for a mix.
-///
-/// The code point of z is `z + 32 * L + (z < 224 ? -0x400 : 0x1C00)`, with
-/// the i8 `L` of the block z >> 5 at
-/// `NEON_ENCODE_L[(NEON_ENCODE_START[z >> 8] + (z >> 5)) % 128]`.
+/// Encodes the 30 bytes at `src` (32 are read) as 16 characters at `d` if
+/// all of them are 2-byte characters, and returns 32 (the bytes written).
+/// Otherwise writes nothing, stores the 16 values at `zs` and returns 0.
 #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
 #[target_feature(enable = "neon")]
 #[inline]
-pub unsafe fn encode16_neon(src: *const u8, d: *mut u8) -> usize {
+pub unsafe fn encode16_2byte_neon(src: *const u8, d: *mut u8, zs: *mut u16) -> usize {
     use crate::table;
     use core::arch::aarch64::*;
 
@@ -1092,22 +1093,17 @@ pub unsafe fn encode16_neon(src: *const u8, d: *mut u8) -> usize {
     static Y1: [u8; 16] = unpack(1, true);
     static SHX: [i16; 8] = shifts(false);
     static SHY: [i16; 8] = shifts(true);
-    static START: [u8; 128] = table::NEON_ENCODE_START;
-    static L: [u8; 128] = table::NEON_ENCODE_L;
+    static PREFIX: [u16; 8] = table::ENCODE_2BYTE_PREFIX;
     let dup = vdupq_n_u8;
 
     // SAFETY: the caller guarantees 32 readable bytes at `src`; the tables
     // are read within their lengths.
-    let (input, shx, shy, start_t, l_t) = unsafe {
+    let (input, shx, shy, prefix) = unsafe {
         (
             vld1q_u8_x2(src),
             vld1q_s16(SHX.as_ptr()),
             vld1q_s16(SHY.as_ptr()),
-            [
-                vld1q_u8_x4(START.as_ptr()),
-                vld1q_u8_x4(START.as_ptr().add(64)),
-            ],
-            [vld1q_u8_x4(L.as_ptr()), vld1q_u8_x4(L.as_ptr().add(64))],
+            vld1q_u8(PREFIX.as_ptr().cast()),
         )
     };
     // z = (x << r | y >> (16 - r)) >> 1: bits r..r + 15 of bytes j..j + 2.
@@ -1122,57 +1118,33 @@ pub unsafe fn encode16_neon(src: *const u8, d: *mut u8) -> usize {
     let z1 = unpack_half(&X1, &Y1);
 
     // 2-byte characters are the first 7 blocks.
+    let limit = vdupq_n_u16(224);
     let two = vcombine_u8(
-        vmovn_u16(vcltq_u16(z0, vdupq_n_u16(224))),
-        vmovn_u16(vcltq_u16(z1, vdupq_n_u16(224))),
+        vmovn_u16(vcltq_u16(z0, limit)),
+        vmovn_u16(vcltq_u16(z1, limit)),
     );
-    let all_two = vminvq_u8(two) != 0;
-    if vmaxvq_u8(two) != 0 && !(ENCODE_2BYTE && all_two) {
+    if vminvq_u8(two) == 0 {
+        // SAFETY: the caller guarantees 16 writable values at `zs`.
+        unsafe {
+            vst1q_u16(zs, z0);
+            vst1q_u16(zs.add(8), z1);
+        }
         return 0;
     }
-
-    // The block's L: unit z >> 8 (0..=127) selects the start, then
-    // start + (z >> 5) % 256 (mod 128) the byte.
-    let unit = vcombine_u8(vshrn_n_u16::<8>(z0), vshrn_n_u16::<8>(z1));
-    let block = vcombine_u8(vshrn_n_u16::<5>(z0), vshrn_n_u16::<5>(z1));
-    let lookup =
-        |t: &[uint8x16x4_t; 2], i| vqtbx4q_u8(vqtbl4q_u8(t[0], i), t[1], vsubq_u8(i, dup(64)));
-    let start = lookup(&start_t, unit);
-    let l = vreinterpretq_s8_u8(lookup(&l_t, vandq_u8(vaddq_u8(start, block), dup(127))));
-    let adj = vdupq_n_u16(if all_two { 0xFC00 } else { 0x1C00 });
-    let cp0 = vaddq_u16(
-        vaddq_u16(z0, adj),
-        vreinterpretq_u16_s16(vshll_n_s8::<5>(vget_low_s8(l))),
+    // (b0, b1) of the block's first character from the 16-byte
+    // `ENCODE_2BYTE_PREFIX`, with the low 5 bits of z in b1 (as for AVX-512).
+    let z8 = vcombine_u8(vmovn_u16(z0), vmovn_u16(z1));
+    let pair = vshlq_n_u8::<1>(vshrq_n_u8::<5>(z8));
+    let b0 = vqtbl1q_u8(prefix, pair);
+    let b1 = vorrq_u8(
+        vqtbl1q_u8(prefix, vorrq_u8(pair, dup(1))),
+        vandq_u8(z8, dup(31)),
     );
-    let cp1 = vaddq_u16(
-        vaddq_u16(z1, adj),
-        vreinterpretq_u16_s16(vshll_high_n_s8::<5>(l)),
-    );
-
-    let lo = vcombine_u8(vmovn_u16(cp0), vmovn_u16(cp1));
-    // 10cccccc of the low 6 bits.
-    let b_last = vbslq_u8(dup(0x3F), lo, dup(0x80));
-    if all_two {
-        // 110aaaaa 10cccccc.
-        let b0 = vorrq_u8(
-            vcombine_u8(vshrn_n_u16::<6>(cp0), vshrn_n_u16::<6>(cp1)),
-            dup(0xC0),
-        );
-        // SAFETY: the caller guarantees 48 writable bytes at `d`.
-        unsafe { vst2q_u8(d, uint8x16x2_t(b0, b_last)) };
-        return 32;
-    }
-    // 1110aaaa 10bbbbbb 10cccccc.
-    let hi = vcombine_u8(vshrn_n_u16::<8>(cp0), vshrn_n_u16::<8>(cp1));
-    let b0 = vorrq_u8(vshrq_n_u8::<4>(hi), dup(0xE0));
-    let b1 = vbslq_u8(
-        dup(0x3F),
-        vsliq_n_u8::<2>(vshrq_n_u8::<6>(lo), hi),
-        dup(0x80),
-    );
-    // SAFETY: as above.
-    unsafe { vst3q_u8(d, uint8x16x3_t(b0, b1, b_last)) };
-    48
+    // SAFETY: the caller guarantees 32 writable bytes at `d`.
+    unsafe { vst2q_u8(d, uint8x16x2_t(b0, b1)) };
+    #[cfg(test)]
+    NEON_WINDOWS.with(|n| n[2].set(n[2].get() + 1));
+    32
 }
 
 /// Packs eight 15-bit values (u16 lanes) into the first 15 bytes.
@@ -1200,16 +1172,17 @@ pub fn pack8_neon(z: core::arch::aarch64::uint16x8_t) -> core::arch::aarch64::ui
 /// (16 bytes are stored per group).
 ///
 /// The rank query works on 256-code-point pages, so that the missing block
-/// mask, its popcount and the offset each fit in a byte (see build.rs).
+/// mask, its popcount and the offset each fit in a byte, with 64-entry
+/// tables (see build.rs).
 #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
 #[target_feature(enable = "neon")]
 #[inline]
 pub unsafe fn decode16_neon(p: *const u8, d: *mut u8) -> usize {
     use crate::table;
     use core::arch::aarch64::*;
-    static HDESC: [u8; 128] = table::NEON_HALF_DESC;
-    static MISSING: [u8; 64] = table::NEON_MISSING;
-    static END: [u8; 64] = table::NEON_END;
+    static START: [u8; 64] = table::NEON_PAGE_START;
+    static MISSING: [u8; 64] = table::NEON_PAGE_MISSING;
+    static END: [u8; 64] = table::NEON_PAGE_END;
     let dup = vdupq_n_u8;
 
     // As in `code_points_8x3`, `ld3` through `asm!`.
@@ -1232,17 +1205,15 @@ pub unsafe fn decode16_neon(p: *const u8, d: *mut u8) -> usize {
     let lo = vsliq_n_u8::<6>(b2, b1);
 
     // SAFETY: each `vld1q_u8_x4` reads 64 bytes of a table at least that long.
-    let (hdesc0, hdesc1, missing_t, end_t) = unsafe {
+    let (start_t, missing_t, end_t) = unsafe {
         (
-            vld1q_u8_x4(HDESC.as_ptr()),
-            vld1q_u8_x4(HDESC.as_ptr().add(64)),
+            vld1q_u8_x4(START.as_ptr()),
             vld1q_u8_x4(MISSING.as_ptr()),
             vld1q_u8_x4(END.as_ptr()),
         )
     };
-    let h = vshrq_n_u8::<1>(hi);
-    let desc = vqtbx4q_u8(vqtbl4q_u8(hdesc0, h), hdesc1, vsubq_u8(h, dup(64)));
-    let page = vorrq_u8(desc, vandq_u8(hi, dup(1)));
+    // The page's entry: its group's biased start plus the page (mod 256).
+    let page = vaddq_u8(vqtbl4q_u8(start_t, vshrq_n_u8::<2>(hi)), hi);
     let missing = vqtbl4q_u8(missing_t, page);
     // Missing blocks from this one through the end of the page; bit zero
     // marks a character outside the repertoire.
@@ -1271,146 +1242,11 @@ pub unsafe fn decode16_neon(p: *const u8, d: *mut u8) -> usize {
             vst1q_u8(d.add(15), pack8_neon(z1));
         }
     }
+    #[cfg(test)]
+    if groups == 2 {
+        NEON_WINDOWS.with(|n| n[0].set(n[0].get() + 1));
+    }
     groups
-}
-
-/// tbl indices that gather (b0, b1, b2) of 4 characters of 2 or 3 bytes
-/// (b0 = 0 for 2-byte ones) into bytes 0..4, 4..8 and 8..12, per 5-bit
-/// class of the lead flags at bytes 3, 5, 7, 9 and 11, and the bytes the 4
-/// characters take. Every pattern of 8 lengths gives a class whose first 4
-/// lengths are determined (checked here); unused classes are never formed
-/// from valid UTF-8 of 2- and 3-byte characters.
-#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
-const DEINTERLEAVE: ([[u8; 16]; 32], [u8; 32]) = {
-    let mut t = [[0xFFu8; 16]; 32];
-    let mut n = [0u8; 32];
-    let mut pat = 0;
-    while pat < 256 {
-        let mut lead = [false; 32];
-        let mut starts = [0usize; 9];
-        let mut k = 0;
-        while k < 8 {
-            starts[k + 1] = starts[k] + 2 + (pat >> k & 1);
-            lead[starts[k]] = true;
-            k += 1;
-        }
-        let class = lead[3] as usize
-            | (lead[5] as usize) << 1
-            | (lead[7] as usize) << 2
-            | (lead[9] as usize) << 3
-            | (lead[11] as usize) << 4;
-        let mut e = [0xFFu8; 16];
-        let mut c = 0;
-        while c < 4 {
-            let (s, three) = (starts[c], pat >> c & 1 == 1);
-            if three {
-                e[c] = s as u8;
-            }
-            e[4 + c] = (s + three as usize) as u8;
-            e[8 + c] = (s + three as usize + 1) as u8;
-            c += 1;
-        }
-        if n[class] == 0 {
-            t[class] = e;
-            n[class] = starts[4] as u8;
-        } else {
-            let mut i = 0;
-            while i < 16 {
-                assert!(t[class][i] == e[i]);
-                i += 1;
-            }
-            assert!(n[class] == starts[4] as u8);
-        }
-        pat += 1;
-    }
-    (t, n)
-};
-
-/// Decodes 8 characters of 2 or 3 bytes each at `p` (up to 28 bytes are
-/// read) and writes them to `d` as 15 bytes (16 are stored). Returns the
-/// number of input bytes taken, or 0 (nothing written) if any of them is
-/// not a 15-bit character or a byte of the window is outside 0x80..0xF0.
-#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
-#[target_feature(enable = "neon")]
-#[inline]
-pub unsafe fn decode8_mixed_neon(p: *const u8, d: *mut u8) -> usize {
-    use crate::table;
-    use core::arch::aarch64::*;
-    static LUT: [[u8; 16]; 32] = DEINTERLEAVE.0;
-    static TAKEN: [u8; 32] = DEINTERLEAVE.1;
-    static WEIGHT: [i8; 8] = [-8, -6, -5, -4, -3, -2, -8, -8];
-    static HDESC: [u8; 128] = table::NEON_HALF_DESC;
-    static MISSING: [u8; 64] = table::NEON_MISSING;
-    static END: [u8; 64] = table::NEON_END;
-    static GATHER: [[u8; 8]; 3] = [
-        [0, 1, 2, 3, 16, 17, 18, 19],
-        [4, 5, 6, 7, 20, 21, 22, 23],
-        [8, 9, 10, 11, 24, 25, 26, 27],
-    ];
-
-    // 4 characters at `q`: (b0, b1, b2) by tbl, the bytes taken, and
-    // whether all 16 bytes read are within 0x80..0xF0.
-    let step = |q: *const u8| {
-        // SAFETY: the caller guarantees 16 readable bytes at `q` (below).
-        let v = unsafe { vld1q_u8(q) };
-        let in_range = vmaxvq_u8(veorq_u8(v, vdupq_n_u8(0x80))) < 0x70;
-        // Lead flags (bit 6) of the odd bytes 1, 3, .., 15, weighted into
-        // bits 0..5 of the class (byte 1 is never a lead).
-        let odd = vget_low_u8(vuzp2q_u8(v, v));
-        // SAFETY: `WEIGHT` is 8 bytes.
-        let w = unsafe { vld1_s8(WEIGHT.as_ptr()) };
-        let class = vaddv_u8(vshl_u8(vand_u8(odd, vdup_n_u8(0x40)), w)) as usize & 31;
-        // SAFETY: `class < 32`.
-        let idx = unsafe { vld1q_u8(LUT[class].as_ptr()) };
-        (vqtbl1q_u8(v, idx), TAKEN[class] as usize, in_range)
-    };
-    // SAFETY: 4 characters take at most 12 bytes, so the second step reads
-    // within `p .. p + 28`.
-    let (g0, n0, ok0) = step(p);
-    let (g1, n1, ok1) = step(unsafe { p.add(n0) });
-    if !(ok0 && ok1) {
-        return 0;
-    }
-    let g = uint8x16x2_t(g0, g1);
-    // SAFETY: `GATHER` rows are 8 bytes.
-    let (b0, b1, b2) = unsafe {
-        (
-            vqtbl2_u8(g, vld1_u8(GATHER[0].as_ptr())),
-            vqtbl2_u8(g, vld1_u8(GATHER[1].as_ptr())),
-            vqtbl2_u8(g, vld1_u8(GATHER[2].as_ptr())),
-        )
-    };
-    // As in `decode16_neon`; for a 2-byte character b0 = 0 and b1 is the
-    // lead, which gives the same hi and lo.
-    let hi = vsli_n_u8::<4>(vshr_n_u8::<2>(b1), b0);
-    let lo = vsli_n_u8::<6>(b2, b1);
-    // SAFETY: each `vld1q_u8_x4` reads 64 bytes of a table at least that long.
-    let (hdesc0, hdesc1, missing_t, end_t) = unsafe {
-        (
-            vld1q_u8_x4(HDESC.as_ptr()),
-            vld1q_u8_x4(HDESC.as_ptr().add(64)),
-            vld1q_u8_x4(MISSING.as_ptr()),
-            vld1q_u8_x4(END.as_ptr()),
-        )
-    };
-    let h = vshr_n_u8::<1>(hi);
-    let desc = vqtbx4_u8(vqtbl4_u8(hdesc0, h), hdesc1, vsub_u8(h, vdup_n_u8(64)));
-    let page = vorr_u8(desc, vand_u8(hi, vdup_n_u8(1)));
-    let missing = vqtbl4_u8(missing_t, page);
-    let suffix = vshl_u8(missing, vneg_s8(vreinterpret_s8_u8(vshr_n_u8::<5>(lo))));
-    if vmaxv_u8(vand_u8(suffix, vdup_n_u8(1))) != 0 {
-        return 0;
-    }
-    // z = cp - 32 * delta - 0x1C00 (3-byte) or + 0x400 (2-byte): the
-    // correction is subtracted from the high byte.
-    let delta = vreinterpret_s8_u8(vsub_u8(vqtbl4_u8(end_t, page), vcnt_u8(suffix)));
-    let three = vtst_u8(b0, b0);
-    let hi_adj = vsub_u8(hi, vbsl_u8(three, vdup_n_u8(0x1C), vdup_n_u8(0xFC)));
-    let cp = vreinterpretq_u16_u8(vcombine_u8(vzip1_u8(lo, hi_adj), vzip2_u8(lo, hi_adj)));
-    let z = vsubq_u16(cp, vreinterpretq_u16_s16(vshll_n_s8::<5>(delta)));
-    // SAFETY: the caller guarantees 16 writable bytes at `d`.
-    unsafe { vst1q_u8(d, pack8_neon(z)) };
-    n0 + n1
 }
 
 /// Decodes up to 16 two-byte 15-bit characters at `p .. p + 32`, as
@@ -1445,6 +1281,10 @@ pub unsafe fn decode16_2byte_neon(p: *const u8, d: *mut u8) -> usize {
         if groups == 2 {
             vst1q_u8(d.add(15), pack8_neon(vmovl_high_u8(z)));
         }
+    }
+    #[cfg(test)]
+    if groups == 2 {
+        NEON_WINDOWS.with(|n| n[1].set(n[1].get() + 1));
     }
     groups
 }
