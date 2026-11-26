@@ -641,24 +641,27 @@ unsafe fn decode_fast<const SIMD: bool, const AVX512: bool, const DENSE: bool>(
             // the 16th byte stored is within the capacity of the rest of
             // the 48 bytes.
             let two = DENSE && unsafe { *src.add(pos) } < 0xE0;
-            let groups = unsafe {
+            // Bytes taken: 16 characters in 32 (2-byte), 47 or 48 bytes, or
+            // the first 8 in 16 or 24.
+            let n = unsafe {
                 if two {
-                    simd::decode16_2byte_neon(src.add(pos), dst.add(written))
+                    16 * simd::decode16_2byte_neon(src.add(pos), dst.add(written))
                 } else {
                     simd::decode16_neon(src.add(pos), dst.add(written))
                 }
             };
-            let step = if two { 16 } else { 24 };
             // As for AVX-512, a whole window keeps the next position
             // independent of the vector computation.
-            if groups == 2 {
-                pos += 2 * step;
+            if n >= 32 {
+                pos += n;
                 written += 30;
                 continue;
             }
             // The 8-character path below takes the rejected group.
-            pos += step * groups;
-            written += 15 * groups;
+            if n != 0 {
+                pos += n;
+                written += 15;
+            }
         }
         // SAFETY: `pos + 24 <= len`.
         let (v, n) = unsafe { read_8::<SIMD>(src.add(pos)) };
@@ -1503,6 +1506,50 @@ mod tests {
             let before = count(1);
             assert_eq!(decode_impl::<LEVEL_SIMD>(&encoded).unwrap(), zeros);
             assert_eq!(count(1) > before, used, "{len}");
+        }
+    }
+
+    /// The 47-byte NEON window: one 2-byte character in each of the 16
+    /// lanes, followed by ASCII, a 4-byte, a 7-bit or a 3-byte character;
+    /// a 7-bit or invalid character as the short one; and two 2-byte
+    /// characters at every pair of lanes, which the path must leave to the
+    /// others. Every level agrees with scalar code.
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    #[test]
+    fn neon_one_short_windows() {
+        let count = || crate::simd::NEON_DECODE_WINDOWS.with(|n| n[2].get());
+        for k in 0..16 {
+            let values: [u16; 16] = core::array::from_fn(|i| {
+                if i == k {
+                    100 + i as u16
+                } else {
+                    300 + 999 * i as u16
+                }
+            });
+            let head = encode_impl::<LEVEL_SCALAR>(&pack_z15(&values));
+            assert_eq!(head.len(), 47);
+            for next in ["A", "\u{10000}", "\u{180}", "\u{3400}\u{3400}"] {
+                let before = count();
+                let _ = decode_every_level(&format!("{head}{next}"));
+                assert!(count() > before, "{k} {next:?}");
+            }
+            let pos = head.char_indices().nth(k).unwrap().0;
+            for bad in ['\u{180}', '\u{7FF}'] {
+                let mut damaged = head.clone();
+                damaged.replace_range(pos..pos + 2, &bad.to_string());
+                let before = count();
+                assert!(decode_every_level(&format!("{damaged}\u{3400}")).is_err());
+                assert_eq!(count(), before, "{k} {bad:?}");
+            }
+            for j in k + 1..16 {
+                let mut values = values;
+                values[j] = 7 * j as u16;
+                let head = encode_impl::<LEVEL_SCALAR>(&pack_z15(&values));
+                let before = count();
+                let data = decode_every_level(&format!("{head}{head}")).unwrap();
+                assert_eq!(&data[..30], pack_z15(&values));
+                assert_eq!(count(), before, "{k} {j}");
+            }
         }
     }
 

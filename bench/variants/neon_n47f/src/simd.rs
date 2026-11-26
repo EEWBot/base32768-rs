@@ -1200,7 +1200,7 @@ pub fn pack8_neon(z: core::arch::aarch64::uint16x8_t) -> core::arch::aarch64::ui
 #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
 #[target_feature(enable = "neon")]
 #[inline]
-pub unsafe fn decode16_neon(p: *const u8, d: *mut u8) -> usize {
+pub unsafe fn decode16_neon(p: *const u8, d: *mut u8, one_short: bool) -> usize {
     use crate::table;
     use core::arch::aarch64::*;
     static START: [u8; 64] = table::NEON_PAGE_START;
@@ -1229,9 +1229,14 @@ pub unsafe fn decode16_neon(p: *const u8, d: *mut u8) -> usize {
         // Not 16 three-byte leads at fixed positions: exactly one 2-byte
         // character, or else a misaligned first group (a 2-byte character
         // among them), rejected before the table lookups.
-        let n = unsafe { decode16_one_short_neon(b0, b1, b2, lead_ok, d) };
-        if n != 0 || first != u64::MAX {
-            return n;
+        if one_short {
+            let n = unsafe { decode16_one_short_neon(b0, b1, b2, lead_ok, d) };
+            if n != 0 {
+                return n;
+            }
+        }
+        if first != u64::MAX {
+            return 0;
         }
     }
     let hi = vsliq_n_u8::<4>(vshrq_n_u8::<2>(b1), b0);
@@ -1300,8 +1305,9 @@ unsafe fn decode16_one_short_neon(
     lead_ok: core::arch::aarch64::uint8x16_t,
     d: *mut u8,
 ) -> usize {
-    // SAFETY: NEON is part of the aarch64 baseline; see the callers for
-    // the pointers.
+    // SAFETY: NEON is part of the aarch64 baseline; the caller guarantees
+    // 32 writable bytes at `d`, and the tables are read within their
+    // lengths.
     unsafe {
         use crate::table;
         use core::arch::aarch64::*;
@@ -1333,14 +1339,12 @@ unsafe fn decode16_one_short_neon(
         let hi = vsliq_n_u8::<4>(vshrq_n_u8::<2>(b1), b0);
         let lo = vsliq_n_u8::<6>(b2, b1);
 
-        // SAFETY: each `vld1q_u8_x4` reads 64 bytes of a table at least that long.
-        let (start_t, missing_t, end_t) = unsafe {
-            (
-                vld1q_u8_x4(START.as_ptr()),
-                vld1q_u8_x4(MISSING.as_ptr()),
-                vld1q_u8_x4(END.as_ptr()),
-            )
-        };
+        // Each `vld1q_u8_x4` reads 64 bytes of a table at least that long.
+        let (start_t, missing_t, end_t) = (
+            vld1q_u8_x4(START.as_ptr()),
+            vld1q_u8_x4(MISSING.as_ptr()),
+            vld1q_u8_x4(END.as_ptr()),
+        );
         let page = vaddq_u8(vqtbl4q_u8(start_t, vshrq_n_u8::<2>(hi)), hi);
         let missing = vqtbl4q_u8(missing_t, page);
         let suffix = vshlq_u8(missing, vnegq_s8(vreinterpretq_s8_u8(vshrq_n_u8::<5>(lo))));
@@ -1358,11 +1362,9 @@ unsafe fn decode16_one_short_neon(
             vreinterpretq_u16_s16(vshll_n_s8::<5>(vget_low_s8(delta))),
         );
         let z1 = vsubq_u16(cp1, vreinterpretq_u16_s16(vshll_high_n_s8::<5>(delta)));
-        // SAFETY: the caller guarantees room for 32 bytes.
-        unsafe {
-            vst1q_u8(d, pack8_neon(z0));
-            vst1q_u8(d.add(15), pack8_neon(z1));
-        }
+        // The caller guarantees room for 32 bytes.
+        vst1q_u8(d, pack8_neon(z0));
+        vst1q_u8(d.add(15), pack8_neon(z1));
         #[cfg(test)]
         NEON_DECODE_WINDOWS.with(|n| n[2].set(n[2].get() + 1));
         47

@@ -289,7 +289,7 @@ fn main() {
         }
     }
 
-    // NEON decode of 3-byte characters: rank queries per 256-code-point page
+    // NEON decode: rank queries per 256-code-point page
     // P (8 blocks), so that masks and popcounts are bytes. Per page: its
     // missing (non-15-bit) blocks, and the missing blocks below its end minus
     // 224 (end 0 when no block is 15-bit). With D = (cp - z) / 32, D - 224
@@ -323,7 +323,9 @@ fn main() {
     let mut neon_page_end: Vec<u8> = pages.iter().map(|&(_, e)| e).collect();
     neon_page_missing.resize(64, 0xFF);
     neon_page_end.resize(64, 0);
-    for cp in 0x800..0x10000u32 {
+    // 2-byte characters use the same tables: D + 32 (69..=88) fits in an
+    // i8 and equals D - 224 mod 256, so z = cp + 0x400 - 32 * delta.
+    for cp in 0x80..0x10000u32 {
         let (hi, lo) = (cp >> 8, cp & 0xFF);
         let page = neon_page_start[(hi >> 2) as usize].wrapping_add(hi as u8) as usize;
         assert!(page < pages.len());
@@ -331,12 +333,17 @@ fn main() {
         let z = decode[cp as usize] as u32;
         assert_eq!(suffix & 1 == 0, z < 0x8000, "U+{cp:04X}");
         if suffix & 1 == 0 {
+            let (bias, adj) = if cp < 0x800 {
+                (32, -0x400)
+            } else {
+                (-224, 0x1C00)
+            };
             assert!(
-                (-128..128).contains(&((cp - z) as i32 / 32 - 224)),
+                (-128..128).contains(&((cp as i32 - z as i32) / 32 + bias)),
                 "U+{cp:04X}"
             );
             let delta = neon_page_end[page].wrapping_sub(suffix.count_ones() as u8) as i8;
-            let neon_z = (cp as i32 - 0x1C00 - 32 * delta as i32) as u32 & 0xFFFF;
+            let neon_z = (cp as i32 - adj - 32 * delta as i32) as u32 & 0xFFFF;
             assert_eq!(neon_z, z, "U+{cp:04X}");
         }
     }
