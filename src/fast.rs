@@ -35,6 +35,35 @@ unsafe fn put(dst: *mut u8, pos: usize, packed: u32) -> usize {
     pos + (packed >> 24) as usize
 }
 
+/// At least 24 of the 32 15-bit values in the 60 bytes are below 224
+/// (2-byte characters).
+#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+#[inline]
+fn two_byte_dense_values(head: &[u8]) -> bool {
+    let (chunks, _) = head.as_chunks::<15>();
+    let count: usize = chunks
+        .iter()
+        .map(|c| {
+            let hi = u64::from_be_bytes(c[0..8].try_into().unwrap());
+            let lo = u64::from_be_bytes(c[7..15].try_into().unwrap());
+            [
+                hi >> 49,
+                hi >> 34,
+                hi >> 19,
+                hi >> 4,
+                lo >> 45,
+                lo >> 30,
+                lo >> 15,
+                lo,
+            ]
+            .iter()
+            .filter(|&&z| z & 0x7FFF < 224)
+            .count()
+        })
+        .sum();
+    count >= 24
+}
+
 /// Returns `x` unchanged. When AVX-512 is enabled at compile time (e.g.
 /// `-C target-cpu=native` on Zen 4/5 or Sapphire Rapids), LLVM turns the eight
 /// table lookups in `encode` into a `vpgatherqd` plus `vpextrd` stores, which
@@ -158,6 +187,42 @@ fn encode_append<const LEVEL: u8>(b: &[u8], out: &mut Vec<u8>) {
         }
         // SAFETY: AVX2 was just checked.
         (done, pos) = unsafe { encode_avx2(b, dst, done, pos) };
+    }
+
+    // NEON: inputs of mostly 2-byte characters (runs of zero bytes), 30
+    // bytes -> 16 characters per window. Other inputs take only the scalar
+    // path, which is faster for 3-byte characters than NEON.
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    if LEVEL >= LEVEL_SIMD && b.len() >= 1024 && two_byte_dense_values(&b[..60]) {
+        // In its own function, like the 2-byte AVX-512 decode path, so that
+        // the scalar loop below compiles as without it.
+        #[inline(never)]
+        unsafe fn encode_neon_dense(b: &[u8], dst: *mut u8) -> (usize, usize) {
+            let (mut done, mut pos) = (0, 0);
+            while done + 32 <= b.len() {
+                let mut zs = [0u16; 16];
+                // SAFETY: 32 bytes are readable at `done`, and the 30 bytes
+                // encoded reserve 16 * 3 = 48 output bytes.
+                let n = unsafe {
+                    simd::encode16_2byte_neon(b.as_ptr().add(done), dst.add(pos), zs.as_mut_ptr())
+                };
+                if n != 0 {
+                    pos += n;
+                } else {
+                    // Some 3-byte characters: the scalar table, from the
+                    // values already unpacked.
+                    for &z in &zs {
+                        // SAFETY: within the 48 bytes reserved, plus the
+                        // spare byte of the characters that follow.
+                        pos = unsafe { put(dst, pos, z15_utf8(z as u32)) };
+                    }
+                }
+                done += 30;
+            }
+            (done, pos)
+        }
+        // SAFETY: see above; `dst` has the capacity for all of `b`.
+        (done, pos) = unsafe { encode_neon_dense(b, dst) };
     }
 
     // Fast path: 15 bytes -> 8 characters.
@@ -1124,6 +1189,22 @@ mod tests {
                 let t = format!("{}{bad}{}", &s[..i], &s[i + c.len_utf8()..]);
                 let _ = decode_every_level(&t);
             }
+        }
+    }
+
+    /// The NEON 2-byte encode path runs for long inputs of 2-byte
+    /// characters only.
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    #[test]
+    fn neon_encode_path_runs() {
+        let windows = || crate::simd::NEON_ENCODE_WINDOWS.with(|n| n.get());
+        // 500 bytes are below the 1 KiB the path needs.
+        for (len, used) in [(3000, true), (500, false)] {
+            let zeros = vec![0u8; len];
+            let before = windows();
+            let encoded = encode_impl::<LEVEL_SIMD>(&zeros);
+            assert_eq!(windows() > before, used, "{len}");
+            assert_eq!(decode_impl::<LEVEL_SIMD>(&encoded).unwrap(), zeros);
         }
     }
 

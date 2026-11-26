@@ -849,6 +849,13 @@ pub unsafe fn decode32_2byte_avx512(p: *const u8, d: *mut u8) -> usize {
     groups
 }
 
+#[cfg(all(test, target_arch = "aarch64", target_endian = "little"))]
+thread_local! {
+    /// Number of 16-character windows the NEON 2-byte encode path wrote on
+    /// this thread.
+    pub static NEON_ENCODE_WINDOWS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
 #[cfg(all(test, target_arch = "x86_64"))]
 thread_local! {
     /// Number of 32-character blocks the AVX-512 path decoded on this
@@ -1038,6 +1045,104 @@ pub unsafe fn code_points_8x3(p: *const u8) -> Option<[u16; 8]> {
     // SAFETY: `out` is 16 bytes.
     unsafe { vst1q_u8(out.as_mut_ptr().cast(), cp) };
     Some(out)
+}
+
+/// Encodes the 30 bytes at `src` (32 are read) as 16 characters at `d` if
+/// all of them are 2-byte characters, and returns 32 (the bytes written).
+/// Otherwise writes nothing, stores the 16 values at `zs` and returns 0.
+#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+#[target_feature(enable = "neon")]
+#[inline]
+pub unsafe fn encode16_2byte_neon(src: *const u8, d: *mut u8, zs: *mut u16) -> usize {
+    use crate::table;
+    use core::arch::aarch64::*;
+
+    /// tbl indices of u16 lane i of half h (15 bytes from byte 15h): bytes
+    /// (j, j + 1) as a big-endian u16, or byte j + 2 in the high byte (y),
+    /// where j = 15h + 15i / 8. 0xFF reads as zero.
+    const fn unpack(h: usize, y: bool) -> [u8; 16] {
+        let mut m = [0xFFu8; 16];
+        let mut i = 0;
+        while i < 8 {
+            let j = 15 * h + 15 * i / 8;
+            if y {
+                m[2 * i + 1] = (j + 2) as u8;
+            } else {
+                m[2 * i] = (j + 1) as u8;
+                m[2 * i + 1] = j as u8;
+            }
+            i += 1;
+        }
+        m
+    }
+    /// Shifts of x (bit offset 15i % 8 of value i in byte j), and of y.
+    const fn shifts(y: bool) -> [i16; 8] {
+        let mut s = [0i16; 8];
+        let mut i = 0;
+        while i < 8 {
+            s[i] = (15 * i % 8) as i16 - if y { 16 } else { 0 };
+            i += 1;
+        }
+        s
+    }
+    static X0: [u8; 16] = unpack(0, false);
+    static Y0: [u8; 16] = unpack(0, true);
+    static X1: [u8; 16] = unpack(1, false);
+    static Y1: [u8; 16] = unpack(1, true);
+    static SHX: [i16; 8] = shifts(false);
+    static SHY: [i16; 8] = shifts(true);
+    static PREFIX: [u16; 8] = table::ENCODE_2BYTE_PREFIX;
+    let dup = vdupq_n_u8;
+
+    // SAFETY: the caller guarantees 32 readable bytes at `src`; the tables
+    // are read within their lengths.
+    let (input, shx, shy, prefix) = unsafe {
+        (
+            vld1q_u8_x2(src),
+            vld1q_s16(SHX.as_ptr()),
+            vld1q_s16(SHY.as_ptr()),
+            vld1q_u8(PREFIX.as_ptr().cast()),
+        )
+    };
+    // z = (x << r | y >> (16 - r)) >> 1: bits r..r + 15 of bytes j..j + 2.
+    let unpack_half = |xi: &[u8; 16], yi: &[u8; 16]| {
+        // SAFETY: both index tables are 16 bytes.
+        let (xi, yi) = unsafe { (vld1q_u8(xi.as_ptr()), vld1q_u8(yi.as_ptr())) };
+        let x = vreinterpretq_u16_u8(vqtbl2q_u8(input, xi));
+        let y = vreinterpretq_u16_u8(vqtbl2q_u8(input, yi));
+        vshrq_n_u16::<1>(vorrq_u16(vshlq_u16(x, shx), vshlq_u16(y, shy)))
+    };
+    let z0 = unpack_half(&X0, &Y0);
+    let z1 = unpack_half(&X1, &Y1);
+
+    // 2-byte characters are the first 7 blocks.
+    let limit = vdupq_n_u16(224);
+    let two = vcombine_u8(
+        vmovn_u16(vcltq_u16(z0, limit)),
+        vmovn_u16(vcltq_u16(z1, limit)),
+    );
+    if vminvq_u8(two) == 0 {
+        // SAFETY: the caller guarantees 16 writable values at `zs`.
+        unsafe {
+            vst1q_u16(zs, z0);
+            vst1q_u16(zs.add(8), z1);
+        }
+        return 0;
+    }
+    // (b0, b1) of the block's first character from the 16-byte
+    // `ENCODE_2BYTE_PREFIX`, with the low 5 bits of z in b1 (as for AVX-512).
+    let z8 = vcombine_u8(vmovn_u16(z0), vmovn_u16(z1));
+    let pair = vshlq_n_u8::<1>(vshrq_n_u8::<5>(z8));
+    let b0 = vqtbl1q_u8(prefix, pair);
+    let b1 = vorrq_u8(
+        vqtbl1q_u8(prefix, vorrq_u8(pair, dup(1))),
+        vandq_u8(z8, dup(31)),
+    );
+    // SAFETY: the caller guarantees 32 writable bytes at `d`.
+    unsafe { vst2q_u8(d, uint8x16x2_t(b0, b1)) };
+    #[cfg(test)]
+    NEON_ENCODE_WINDOWS.with(|n| n.set(n.get() + 1));
+    32
 }
 
 /// Never called: `SIMD` is only enabled on the architectures above.
