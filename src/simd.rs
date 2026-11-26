@@ -1399,11 +1399,19 @@ pub unsafe fn decode16_2byte_neon(p: *const u8, d: *mut u8) -> usize {
     let groups = if vgetq_lane_u64::<1>(bad) == 0 { 2 } else { 1 };
     let z = vorrq_u8(base, vandq_u8(cont, dup(31)));
 
+    // z < 224, so the top 7 bits of each 15-bit field are zero: output
+    // bytes 2i and 2i + 1 of a group are z_i >> (7 - i) and z_i << (1 + i)
+    // (zero for i = 7, the unused 16th byte).
+    static EVEN: [i8; 16] = [-7, -6, -5, -4, -3, -2, -1, 0, -7, -6, -5, -4, -3, -2, -1, 0];
+    static ODD: [i8; 16] = [1, 2, 3, 4, 5, 6, 7, 8, 1, 2, 3, 4, 5, 6, 7, 8];
+    // SAFETY: both tables are 16 bytes.
+    let (even, odd) = unsafe { (vld1q_s8(EVEN.as_ptr()), vld1q_s8(ODD.as_ptr())) };
+    let (even, odd) = (vshlq_u8(z, even), vshlq_u8(z, odd));
     // SAFETY: the caller guarantees room for 16 bytes per group.
     unsafe {
-        vst1q_u8(d, pack8_neon(vmovl_u8(vget_low_u8(z))));
+        vst1q_u8(d, vzip1q_u8(even, odd));
         if groups == 2 {
-            vst1q_u8(d.add(15), pack8_neon(vmovl_high_u8(z)));
+            vst1q_u8(d.add(15), vzip2q_u8(even, odd));
         }
     }
     #[cfg(test)]
