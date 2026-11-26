@@ -63,6 +63,60 @@ fn write_array<T: std::fmt::LowerHex>(
     writeln!(out, "];").unwrap();
 }
 
+/// Greedy shortest common superstring of `patterns`: merges the pair with
+/// the longest overlap until one string is left.
+fn superstring<T: PartialEq + Clone>(patterns: &[Vec<T>]) -> Vec<T> {
+    let mut strings: Vec<Vec<T>> = vec![];
+    for p in patterns {
+        if !strings.contains(p) {
+            strings.push(p.clone());
+        }
+    }
+    let overlap = |a: &[T], b: &[T]| -> usize {
+        (0..=a.len().min(b.len()))
+            .rev()
+            .find(|&k| a[a.len() - k..] == b[..k])
+            .unwrap()
+    };
+    while strings.len() > 1 {
+        let mut best = (0, 1, 0);
+        for i in 0..strings.len() {
+            for j in 0..strings.len() {
+                if i != j {
+                    let k = overlap(&strings[i], &strings[j]);
+                    if k >= best.2 {
+                        best = (i, j, k);
+                    }
+                }
+            }
+        }
+        let (i, j, k) = best;
+        let mut merged = strings[i].clone();
+        merged.extend_from_slice(&strings[j][k..]);
+        strings.remove(i.max(j));
+        strings.remove(i.min(j));
+        strings.push(merged);
+    }
+    strings.pop().unwrap()
+}
+
+/// Overlaps the 8-byte patterns of the 128 units into one string of at most
+/// 128 bytes and returns it, padded to 128 bytes, with each unit's start
+/// biased by -8u (mod 128).
+fn overlap_units(unit: &dyn Fn(u32) -> Vec<u8>) -> (Vec<u8>, Vec<u8>) {
+    let patterns: Vec<Vec<u8>> = (0..128).map(unit).collect();
+    let mut string = superstring(&patterns);
+    assert!(string.len() <= 128, "{} bytes", string.len());
+    let mut start = vec![0u8; 128];
+    for u in 0..128u32 {
+        let p = unit(u);
+        let s = string.windows(8).position(|w| w == &p[..]).unwrap() as u32;
+        start[u as usize] = (s.wrapping_sub(8 * u) & 127) as u8;
+    }
+    string.resize(128, 0);
+    (string, start)
+}
+
 fn main() {
     let z15_blocks = ranges_to_blocks(Z15_CHAR_RANGES);
     let z7_blocks = ranges_to_blocks(Z7_CHAR_RANGES);
@@ -127,49 +181,7 @@ fn main() {
             .map(|b| u8::try_from(d_of(u << 8 | b << 5) - high(u << 8 | b << 5)).unwrap())
             .collect()
     };
-    let mut strings: Vec<Vec<u8>> = vec![];
-    for u in 0..128 {
-        let p = unit_lows(u);
-        if !strings.contains(&p) {
-            strings.push(p);
-        }
-    }
-    // Greedy shortest common superstring: merge the pair with the longest
-    // overlap until one string is left.
-    let overlap = |a: &[u8], b: &[u8]| -> usize {
-        (0..=a.len().min(b.len()))
-            .rev()
-            .find(|&k| a[a.len() - k..] == b[..k])
-            .unwrap()
-    };
-    while strings.len() > 1 {
-        let mut best = (0, 1, 0);
-        for i in 0..strings.len() {
-            for j in 0..strings.len() {
-                if i != j {
-                    let k = overlap(&strings[i], &strings[j]);
-                    if k >= best.2 {
-                        best = (i, j, k);
-                    }
-                }
-            }
-        }
-        let (i, j, k) = best;
-        let mut merged = strings[i].clone();
-        merged.extend_from_slice(&strings[j][k..]);
-        strings.remove(i.max(j));
-        strings.remove(i.min(j));
-        strings.push(merged);
-    }
-    let mut encode_offset = strings.pop().unwrap();
-    assert!(encode_offset.len() <= 128, "{} bytes", encode_offset.len());
-    let mut encode_start = vec![0u8; 128];
-    for u in 0..128u32 {
-        let p = unit_lows(u);
-        let start = encode_offset.windows(8).position(|w| w == &p[..]).unwrap() as u32;
-        encode_start[u as usize] = (start.wrapping_sub(8 * u) & 127) as u8;
-    }
-    encode_offset.resize(128, 0);
+    let (encode_offset, encode_start) = overlap_units(&unit_lows);
     for z in 0..0x8000u32 {
         let idx = (encode_start[(z >> 8) as usize] as u32 + (z >> 5 & 0xFF)) & 127;
         let low = encode_offset[idx as usize] as u32;
@@ -274,6 +286,58 @@ fn main() {
                 .wrapping_add(32 * suffix.count_ones())
                 & 0xFFFF;
             assert_eq!(z, decode[cp as usize] as u32, "U+{cp:04X}");
+        }
+    }
+
+    // NEON decode of 3-byte characters: rank queries per 256-code-point page
+    // P (8 blocks), so that masks and popcounts are bytes. Per page: its
+    // missing (non-15-bit) blocks, and the missing blocks below its end minus
+    // 224 (end 0 when no block is 15-bit). With D = (cp - z) / 32, D - 224
+    // fits in an i8 for every 3-byte 15-bit character, so z = cp - 0x1C00 -
+    // 32 * (end - popcount(missing >> block)). The 256 pages are overlapped
+    // per group of 4 into at most 64 entries; the start of group g is biased
+    // by -4g (mod 256), so page P is entry NEON_PAGE_START[P >> 2] + P.
+    let page_entry = |p: u32| -> (u8, u8) {
+        let missing = (0..8).fold(0u8, |m, i| m | (!is15(8 * p + i) as u8) << i);
+        let below = (0..8 * p + 8).filter(|&blk| !is15(blk)).count() as i32;
+        if missing == 0xFF {
+            (0xFF, 0)
+        } else {
+            (missing, (below - 224) as u8)
+        }
+    };
+    let groups: Vec<Vec<(u8, u8)>> = (0..64)
+        .map(|g| (4 * g..4 * g + 4).map(page_entry).collect())
+        .collect();
+    let pages = superstring(&groups);
+    assert!(pages.len() <= 64, "{} page entries", pages.len());
+    let neon_page_start: Vec<u8> = groups
+        .iter()
+        .enumerate()
+        .map(|(g, p)| {
+            let s = pages.windows(4).position(|w| w == &p[..]).unwrap();
+            (s as u32).wrapping_sub(4 * g as u32) as u8
+        })
+        .collect();
+    let mut neon_page_missing: Vec<u8> = pages.iter().map(|&(m, _)| m).collect();
+    let mut neon_page_end: Vec<u8> = pages.iter().map(|&(_, e)| e).collect();
+    neon_page_missing.resize(64, 0xFF);
+    neon_page_end.resize(64, 0);
+    for cp in 0x800..0x10000u32 {
+        let (hi, lo) = (cp >> 8, cp & 0xFF);
+        let page = neon_page_start[(hi >> 2) as usize].wrapping_add(hi as u8) as usize;
+        assert!(page < pages.len());
+        let suffix = neon_page_missing[page] >> (lo >> 5);
+        let z = decode[cp as usize] as u32;
+        assert_eq!(suffix & 1 == 0, z < 0x8000, "U+{cp:04X}");
+        if suffix & 1 == 0 {
+            assert!(
+                (-128..128).contains(&((cp - z) as i32 / 32 - 224)),
+                "U+{cp:04X}"
+            );
+            let delta = neon_page_end[page].wrapping_sub(suffix.count_ones() as u8) as i8;
+            let neon_z = (cp as i32 - 0x1C00 - 32 * delta as i32) as u32 & 0xFFFF;
+            assert_eq!(neon_z, z, "U+{cp:04X}");
         }
     }
 
@@ -393,6 +457,27 @@ fn main() {
         "DECODE_2BYTE_BLOCK",
         "u8",
         &decode_2byte_block,
+    );
+    write_array(
+        &mut out,
+        "/// NEON decode: per group of 4 pages, start in `NEON_PAGE_*` - 4 * group (mod 256).",
+        "NEON_PAGE_START",
+        "u8",
+        &neon_page_start,
+    );
+    write_array(
+        &mut out,
+        "/// NEON decode: missing 15-bit blocks of each page entry.",
+        "NEON_PAGE_MISSING",
+        "u8",
+        &neon_page_missing,
+    );
+    write_array(
+        &mut out,
+        "/// NEON decode: non-15-bit blocks below each page entry's end, minus 224.",
+        "NEON_PAGE_END",
+        "u8",
+        &neon_page_end,
     );
 
     write_array(

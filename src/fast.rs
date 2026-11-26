@@ -601,6 +601,34 @@ unsafe fn decode_fast<const SIMD: bool, const AVX512: bool, const DENSE: bool>(
                 continue;
             }
         }
+        #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+        if SIMD && pos + 48 <= len {
+            // 16 three-byte characters, or (in the dense instance only) 16
+            // two-byte ones after a 2-byte lead.
+            // SAFETY: `pos + 48 <= len`. Each group consumes at least 16
+            // input bytes, which account for its 15 bytes of `dst` capacity;
+            // the 16th byte stored is within the capacity of the rest of
+            // the 48 bytes.
+            let two = DENSE && unsafe { *src.add(pos) } < 0xE0;
+            let groups = unsafe {
+                if two {
+                    simd::decode16_2byte_neon(src.add(pos), dst.add(written))
+                } else {
+                    simd::decode16_neon(src.add(pos), dst.add(written))
+                }
+            };
+            let step = if two { 16 } else { 24 };
+            // As for AVX-512, a whole window keeps the next position
+            // independent of the vector computation.
+            if groups == 2 {
+                pos += 2 * step;
+                written += 30;
+                continue;
+            }
+            // The 8-character path below takes the rejected group.
+            pos += step * groups;
+            written += 15 * groups;
+        }
         // SAFETY: `pos + 24 <= len`.
         let (v, n) = unsafe { read_8::<SIMD>(src.add(pos)) };
         if v.iter().fold(0, |a, &b| a | b) & FLAG7 != 0 {
@@ -630,6 +658,14 @@ unsafe fn decode_fast<const SIMD: bool, const AVX512: bool, const DENSE: bool>(
 /// Runs [`decode_fast`] with the best instruction set available.
 ///
 /// # Safety
+/// At least 24 of the 64 bytes are 2-byte UTF-8 leads (runs of zero bytes
+/// in the input data).
+#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+#[inline]
+fn two_byte_dense(head: &[u8]) -> bool {
+    head.iter().filter(|&&b| b & 0xE0 == 0xC0).count() >= 24
+}
+
 /// See [`decode_fast`].
 #[inline(always)]
 unsafe fn decode_fast_dispatch<const LEVEL: u8>(
@@ -708,8 +744,24 @@ unsafe fn decode_fast_dispatch<const LEVEL: u8>(
 
     #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
     if LEVEL >= LEVEL_SIMD {
+        // As for AVX-512, two functions: with the 2-byte path in the same
+        // function, the 3-byte loop is 10-20% slower on random data.
+        #[inline(never)]
+        unsafe fn decode_fast_neon(bytes: &[u8], dst: *mut u8) -> (usize, usize, usize) {
+            unsafe { decode_fast::<true, false, false>(bytes, dst) }
+        }
+        #[inline(never)]
+        unsafe fn decode_fast_neon_dense(bytes: &[u8], dst: *mut u8) -> (usize, usize, usize) {
+            unsafe { decode_fast::<true, false, true>(bytes, dst) }
+        }
         // SAFETY: NEON is part of the aarch64 baseline.
-        return unsafe { decode_fast::<true, false, false>(bytes, dst) };
+        return unsafe {
+            if bytes.len() >= 1024 && two_byte_dense(&bytes[..64]) {
+                decode_fast_neon_dense(bytes, dst)
+            } else {
+                decode_fast_neon(bytes, dst)
+            }
+        };
     }
 
     unsafe { decode_fast::<false, false, false>(bytes, dst) }
@@ -1224,6 +1276,27 @@ mod tests {
                     data
                 );
             }
+        }
+    }
+
+    /// The NEON decode paths run: 3-byte windows for random data, and the
+    /// 2-byte path for long inputs of 2-byte characters only.
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    #[test]
+    fn neon_decode_paths_run() {
+        let count = |k: usize| crate::simd::NEON_DECODE_WINDOWS.with(|n| n[k].get());
+        let random = random_bytes(3000, 0x1234_5678);
+        let encoded = encode_every_level(&random);
+        let before = count(0);
+        assert_eq!(decode_impl::<LEVEL_SIMD>(&encoded).unwrap(), random);
+        assert!(count(0) > before);
+        // 500 bytes encode to 534 bytes, below the 1 KiB the path needs.
+        for (len, used) in [(3000, true), (500, false)] {
+            let zeros = vec![0u8; len];
+            let encoded = encode_every_level(&zeros);
+            let before = count(1);
+            assert_eq!(decode_impl::<LEVEL_SIMD>(&encoded).unwrap(), zeros);
+            assert_eq!(count(1) > before, used, "{len}");
         }
     }
 
