@@ -1114,23 +1114,22 @@ mod simd {
     }
 
     /// Pack 32 negated 15-bit values into the low 60 bytes. Each signed
-    /// multiply-add produces z[2i] << 15 | z[2i+1]. Rotating the four
-    /// dwords by 2, 4, 6 and 8 positions puts their wrapped bits where the
-    /// preceding dword needs them. PACK drops the last byte in each group.
+    /// multiply-add produces z[2i] << 15 | z[2i+1], a 30-bit pair p. Dword i
+    /// of each 128-bit lane becomes p_i << s_i | p_{i+1} >> (30 - s_i) with
+    /// s = 2, 4, 6, 8 (one vpshldvd on p_{i+1} << 2; dword 3 shifts in
+    /// zeros). PACK drops the last byte in each group.
     #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "avx512f,avx512bw,avx512vbmi")]
+    #[target_feature(enable = "avx512f,avx512bw,avx512vbmi,avx512vbmi2")]
     #[inline]
     unsafe fn pack_neg_z(neg_z: core::arch::x86_64::__m512i) -> core::arch::x86_64::__m512i {
         use core::arch::x86_64::*;
-        static ROT: [u32; 16] = pack_shifts([2, 4, 6, 8]);
-        static WRAP: [u32; 16] = pack_shifts([3, 15, 63, 255]);
+        static SHL: [u32; 16] = pack_shifts([2, 4, 6, 8]);
         static PACK: [u8; 64] = pack_order();
-        // SAFETY: the three tables each contain 64 bytes.
+        // SAFETY: the two tables each contain 64 bytes.
         let ld = |p: *const u8| unsafe { _mm512_loadu_si512(p.cast()) };
         let pairs = _mm512_madd_epi16(neg_z, _mm512_set1_epi32(((-1i32) << 16) | 0x8000));
-        let rot = _mm512_rolv_epi32(pairs, ld(ROT.as_ptr().cast()));
-        let next = _mm512_shuffle_epi32::<0xF9>(rot);
-        let words = _mm512_ternarylogic_epi32::<0xCA>(ld(WRAP.as_ptr().cast()), next, rot);
+        let next = _mm512_slli_epi32::<2>(_mm512_bsrli_epi128::<4>(pairs));
+        let words = _mm512_shldv_epi32(pairs, next, ld(SHL.as_ptr().cast()));
         _mm512_permutexvar_epi8(ld(PACK.as_ptr()), words)
     }
 
