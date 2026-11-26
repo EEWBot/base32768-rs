@@ -631,6 +631,49 @@ pub unsafe fn decode32_windows(bytes: &[u8], dst: *mut u8) -> (usize, usize) {
     // 96-byte window checked in the loop condition.
     let ld = |p: *const u8| unsafe { _mm512_loadu_si512(p.cast()) };
     let w = |x: i16| _mm512_set1_epi16(x);
+    /// Exactly one 2-byte character, k: the 3-byte leads at 3i form the
+    /// low k bits of `aligned`, and characters k.. start one byte early, at
+    /// the fixed indices minus 1 (index 96, byte 64, minus 1 is 95, byte
+    /// 63, through the overlap of the two loads). Checks that every other
+    /// lead is a 3-byte lead and character k's a 2-byte lead, which with
+    /// valid UTF-8 fixes all 32 lengths; the window then takes 95 bytes.
+    #[target_feature(enable = "avx512f,avx512bw,avx512vbmi")]
+    #[inline]
+    unsafe fn one_short(a: __m512i, b: __m512i, aligned: u32) -> Option<(__m512i, __m512i, usize)> {
+        let w = |x: i16| _mm512_set1_epi16(x);
+        let short = aligned.wrapping_add(1);
+        if aligned & short != 0 {
+            return None;
+        }
+        let shifted = !aligned;
+        // SAFETY: the tables have 64 bytes.
+        let (first, last) = unsafe {
+            (
+                _mm512_loadu_si512(FIXED.0.as_ptr().cast()),
+                _mm512_loadu_si512(FIXED.1.as_ptr().cast()),
+            )
+        };
+        let first_idx = _mm512_mask_sub_epi16(first, shifted, first, w(0x0101));
+        let last_idx = _mm512_mask_sub_epi16(last, shifted, last, w(0x0101));
+        let preceding = _mm512_permutex2var_epi8(a, first_idx, b);
+        let three_ok = _mm512_cmpeq_epi16_mask(
+            _mm512_and_si512(preceding, w(0xF000u16 as i16)),
+            w(0xE000u16 as i16),
+        );
+        let two_ok = _mm512_cmpeq_epi16_mask(_mm512_and_si512(preceding, w(0x00E0)), w(0x00C0));
+        if (three_ok | short) != u32::MAX || two_ok & short == 0 {
+            return None;
+        }
+        // As in the general path: a synthetic 3-byte prefix.
+        let prefix = _mm512_mask_mov_epi16(
+            preceding,
+            short,
+            _mm512_or_si512(preceding, w(0xFF00u16 as i16)),
+        );
+        #[cfg(test)]
+        AVX512_ONE_SHORT.with(|n| n.set(n.get() + 1));
+        Some((prefix, _mm512_permutex2var_epi8(a, last_idx, b), 95))
+    }
     let (mut pos, mut written) = (0, 0);
     while bytes.len() - pos >= 96 {
         let p = unsafe { bytes.as_ptr().add(pos) };
@@ -660,6 +703,8 @@ pub unsafe fn decode32_windows(bytes: &[u8], dst: *mut u8) -> (usize, usize) {
                 _mm512_permutex2var_epi8(a, ld(FIXED.1.as_ptr()), b),
                 96,
             )
+        } else if let Some(one) = unsafe { one_short(a, b, aligned) } {
+            one
         } else {
             // With valid UTF-8, all bytes in 0x80..0xEF implies only
             // two- and three-byte characters. On rejection the caller
@@ -854,6 +899,10 @@ thread_local! {
     /// Number of 16-character windows the NEON 2-byte encode path wrote on
     /// this thread.
     pub static NEON_ENCODE_WINDOWS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+    /// Number of 16-character windows the NEON 3-byte and 2-byte decode
+    /// paths decoded on this thread.
+    pub static NEON_DECODE_WINDOWS: [core::cell::Cell<usize>; 2] =
+        const { [core::cell::Cell::new(0), core::cell::Cell::new(0)] };
 }
 
 #[cfg(all(test, target_arch = "x86_64"))]
@@ -865,6 +914,9 @@ thread_local! {
     /// Number of 32-character blocks the 2-byte AVX-512 decode path
     /// processed on this thread.
     pub static AVX512_2BYTE_BLOCKS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+    /// Number of 95-byte windows (one 2-byte character) `decode32_windows`
+    /// took on this thread.
+    pub static AVX512_ONE_SHORT: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
     /// Number of 60-byte blocks the AVX-512 path encoded on this thread.
     pub static AVX512_ENCODE_BLOCKS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
     /// Number of 16-character halves the AVX2 encode path stored as all
@@ -1047,6 +1099,75 @@ pub unsafe fn code_points_8x3(p: *const u8) -> Option<[u16; 8]> {
     Some(out)
 }
 
+/// Encodes the 30 bytes at `src` (31 are read) as 16 characters at `d` if
+/// all of them are 2-byte characters, and returns whether it did (nothing
+/// is written otherwise). Works on bytes only: the low 8 bits of value i of
+/// each 15-byte half are byte 2i << (7 - i) | byte 2i + 1 >> (i + 1), and
+/// the value is below 224 if its top 7 bits are zero and its low 8 bits are
+/// below 224.
+#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+#[target_feature(enable = "neon")]
+#[inline]
+pub unsafe fn encode16_2byte_short_neon(src: *const u8, d: *mut u8) -> bool {
+    use crate::table;
+    use core::arch::aarch64::*;
+    /// The bits of a 15-byte half that hold the top 7 bits of a value. Byte
+    /// 15 of the first load is byte 0 of the second, checked there.
+    const fn short_mask() -> [u8; 16] {
+        let mut m = [0u8; 16];
+        let mut i = 0;
+        while i < 8 {
+            let mut k = 0;
+            while k < 7 {
+                let bit = 15 * i + k;
+                m[bit / 8] |= 0x80 >> (bit % 8);
+                k += 1;
+            }
+            i += 1;
+        }
+        m
+    }
+    static SHORT: [u8; 16] = short_mask();
+    static LEFT: [i8; 16] = [7, 6, 5, 4, 3, 2, 1, 0, 7, 6, 5, 4, 3, 2, 1, 0];
+    static RIGHT: [i8; 16] = [
+        -1, -2, -3, -4, -5, -6, -7, -8, -1, -2, -3, -4, -5, -6, -7, -8,
+    ];
+    static PREFIX: [u16; 8] = table::ENCODE_2BYTE_PREFIX;
+    let dup = vdupq_n_u8;
+
+    // SAFETY: the caller guarantees 31 readable bytes at `src`; the tables
+    // are 16 bytes.
+    let (a, b, short, left, right, prefix) = unsafe {
+        (
+            vld1q_u8(src),
+            vld1q_u8(src.add(15)),
+            vld1q_u8(SHORT.as_ptr()),
+            vld1q_s8(LEFT.as_ptr()),
+            vld1q_s8(RIGHT.as_ptr()),
+            vld1q_u8(PREFIX.as_ptr().cast()),
+        )
+    };
+    // Lanes 0..8 from the first half, 8..16 from the second.
+    let even = vuzp1q_u8(a, b);
+    let odd = vuzp2q_u8(a, b);
+    let z8 = vorrq_u8(vshlq_u8(even, left), vshlq_u8(odd, right));
+    let bad = vorrq_u8(vandq_u8(vorrq_u8(a, b), short), vcgeq_u8(z8, dup(224)));
+    if vmaxvq_u8(bad) != 0 {
+        return false;
+    }
+    let pair = vshlq_n_u8::<1>(vshrq_n_u8::<5>(z8));
+    let b0 = vqtbl1q_u8(prefix, pair);
+    let b1 = vorrq_u8(
+        vqtbl1q_u8(prefix, vorrq_u8(pair, dup(1))),
+        vandq_u8(z8, dup(31)),
+    );
+    // SAFETY: the caller guarantees 32 writable bytes at `d`.
+    unsafe { vst2q_u8(d, uint8x16x2_t(b0, b1)) };
+    #[cfg(test)]
+    NEON_ENCODE_WINDOWS.with(|n| n.set(n.get() + 1));
+    true
+}
+
 /// Encodes the 30 bytes at `src` (32 are read) as 16 characters at `d` if
 /// all of them are 2-byte characters, and returns 32 (the bytes written).
 /// Otherwise writes nothing, stores the 16 values at `zs` and returns 0.
@@ -1143,6 +1264,153 @@ pub unsafe fn encode16_2byte_neon(src: *const u8, d: *mut u8, zs: *mut u16) -> u
     #[cfg(test)]
     NEON_ENCODE_WINDOWS.with(|n| n.set(n.get() + 1));
     32
+}
+
+/// Packs eight 15-bit values (u16 lanes) into the first 15 bytes.
+#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+#[target_feature(enable = "neon")]
+#[inline]
+pub fn pack8_neon(z: core::arch::aarch64::uint16x8_t) -> core::arch::aarch64::uint8x16_t {
+    use core::arch::aarch64::*;
+    static LEFT: [i32; 4] = [0, 2, 4, 6];
+    static RIGHT: [i32; 4] = [-30, -28, -26, -24];
+    // u32 lane i: z[2i] << 17 | z[2i+1] << 2, a left-aligned 30-bit pair.
+    let raw = vreinterpretq_u32_u16(z);
+    let pairs = vsliq_n_u32::<17>(vshlq_n_u32::<2>(vshrq_n_u32::<16>(raw)), raw);
+    // Lane i takes the top bits of pair i + 1 (zero after lane 3).
+    let next = vextq_u32::<1>(pairs, vdupq_n_u32(0));
+    // SAFETY: both tables are 16 bytes.
+    let (left, right) = unsafe { (vld1q_s32(LEFT.as_ptr()), vld1q_s32(RIGHT.as_ptr())) };
+    let words = vorrq_u32(vshlq_u32(pairs, left), vshlq_u32(next, right));
+    vrev32q_u8(vreinterpretq_u8_u32(words))
+}
+
+/// Decodes up to 16 three-byte 15-bit characters at `p .. p + 48`.
+/// Returns how many leading 8-character groups (0..=2) hold only 3-byte
+/// 15-bit characters; those groups are written to `d` as 15 bytes each
+/// (16 bytes are stored per group).
+///
+/// The rank query works on 256-code-point pages, so that the missing block
+/// mask, its popcount and the offset each fit in a byte, with 64-entry
+/// tables (see build.rs).
+#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+#[target_feature(enable = "neon")]
+#[inline]
+pub unsafe fn decode16_neon(p: *const u8, d: *mut u8) -> usize {
+    use crate::table;
+    use core::arch::aarch64::*;
+    static START: [u8; 64] = table::NEON_PAGE_START;
+    static MISSING: [u8; 64] = table::NEON_PAGE_MISSING;
+    static END: [u8; 64] = table::NEON_PAGE_END;
+    let dup = vdupq_n_u8;
+
+    // As in `code_points_8x3`, `ld3` through `asm!`.
+    let (b0, b1, b2): (uint8x16_t, uint8x16_t, uint8x16_t);
+    // SAFETY: the caller guarantees `p .. p + 48` is readable, and `ld3`
+    // with three 16-byte registers reads exactly those 48 bytes.
+    unsafe {
+        core::arch::asm!(
+            "ld3 {{v0.16b, v1.16b, v2.16b}}, [{p}]",
+            p = in(reg) p,
+            out("v0") b0,
+            out("v1") b1,
+            out("v2") b2,
+            options(pure, readonly, nostack, preserves_flags),
+        );
+    }
+    // 1110aaaa 10bbbbbb 10cccccc -> hi = aaaabbbb, lo = bbcccccc.
+    let lead_ok = vceqq_u8(vandq_u8(b0, dup(0xF0)), dup(0xE0));
+    // A misaligned first group (a 2-byte character among them): reject
+    // before the table lookups.
+    if vgetq_lane_u64::<0>(vreinterpretq_u64_u8(lead_ok)) != u64::MAX {
+        return 0;
+    }
+    let hi = vsliq_n_u8::<4>(vshrq_n_u8::<2>(b1), b0);
+    let lo = vsliq_n_u8::<6>(b2, b1);
+
+    // SAFETY: each `vld1q_u8_x4` reads 64 bytes of a table at least that long.
+    let (start_t, missing_t, end_t) = unsafe {
+        (
+            vld1q_u8_x4(START.as_ptr()),
+            vld1q_u8_x4(MISSING.as_ptr()),
+            vld1q_u8_x4(END.as_ptr()),
+        )
+    };
+    // The page's entry: its group's biased start plus the page (mod 256).
+    let page = vaddq_u8(vqtbl4q_u8(start_t, vshrq_n_u8::<2>(hi)), hi);
+    let missing = vqtbl4q_u8(missing_t, page);
+    // Missing blocks from this one through the end of the page; bit zero
+    // marks a character outside the repertoire.
+    let suffix = vshlq_u8(missing, vnegq_s8(vreinterpretq_s8_u8(vshrq_n_u8::<5>(lo))));
+    let bad = vreinterpretq_u64_u8(vornq_u8(vandq_u8(suffix, dup(1)), lead_ok));
+    if vgetq_lane_u64::<0>(bad) != 0 {
+        return 0;
+    }
+    let groups = if vgetq_lane_u64::<1>(bad) == 0 { 2 } else { 1 };
+
+    // D - 224 as an i8, then z = cp - 0x1C00 - 32 * (D - 224).
+    let delta = vreinterpretq_s8_u8(vsubq_u8(vqtbl4q_u8(end_t, page), vcntq_u8(suffix)));
+    let hi_adj = vsubq_u8(hi, dup(0x1C));
+    let cp0 = vreinterpretq_u16_u8(vzip1q_u8(lo, hi_adj));
+    let cp1 = vreinterpretq_u16_u8(vzip2q_u8(lo, hi_adj));
+    let z0 = vsubq_u16(
+        cp0,
+        vreinterpretq_u16_s16(vshll_n_s8::<5>(vget_low_s8(delta))),
+    );
+    let z1 = vsubq_u16(cp1, vreinterpretq_u16_s16(vshll_high_n_s8::<5>(delta)));
+
+    // SAFETY: the caller guarantees room for 16 bytes per group.
+    unsafe {
+        vst1q_u8(d, pack8_neon(z0));
+        if groups == 2 {
+            vst1q_u8(d.add(15), pack8_neon(z1));
+        }
+    }
+    #[cfg(test)]
+    if groups == 2 {
+        NEON_DECODE_WINDOWS.with(|n| n[0].set(n[0].get() + 1));
+    }
+    groups
+}
+
+/// Decodes up to 16 two-byte 15-bit characters at `p .. p + 32`, as
+/// `decode16_neon` does for three-byte ones.
+#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+#[target_feature(enable = "neon")]
+#[inline]
+pub unsafe fn decode16_2byte_neon(p: *const u8, d: *mut u8) -> usize {
+    use crate::table;
+    use core::arch::aarch64::*;
+    static BLOCK: [u8; 64] = table::DECODE_2BYTE_BLOCK;
+    let dup = vdupq_n_u8;
+
+    // SAFETY: the caller guarantees `p .. p + 32` is readable.
+    let uint8x16x2_t(lead, cont) = unsafe { vld2q_u8(p) };
+    let lead_ok = vceqq_u8(vandq_u8(lead, dup(0xE0)), dup(0xC0));
+    // cp >> 5 = (lead & 0x1F) << 1 | bit 5 of the continuation byte.
+    let block = vandq_u8(vsliq_n_u8::<1>(vshrq_n_u8::<5>(cont), lead), dup(63));
+    // SAFETY: the table is 64 bytes.
+    let base = vqtbl4q_u8(unsafe { vld1q_u8_x4(BLOCK.as_ptr()) }, block);
+    // 32 * the block index (even), or 0xFF.
+    let bad = vreinterpretq_u64_u8(vornq_u8(vandq_u8(base, dup(1)), lead_ok));
+    if vgetq_lane_u64::<0>(bad) != 0 {
+        return 0;
+    }
+    let groups = if vgetq_lane_u64::<1>(bad) == 0 { 2 } else { 1 };
+    let z = vorrq_u8(base, vandq_u8(cont, dup(31)));
+
+    // SAFETY: the caller guarantees room for 16 bytes per group.
+    unsafe {
+        vst1q_u8(d, pack8_neon(vmovl_u8(vget_low_u8(z))));
+        if groups == 2 {
+            vst1q_u8(d.add(15), pack8_neon(vmovl_high_u8(z)));
+        }
+    }
+    #[cfg(test)]
+    if groups == 2 {
+        NEON_DECODE_WINDOWS.with(|n| n[1].set(n[1].get() + 1));
+    }
+    groups
 }
 
 /// Never called: `SIMD` is only enabled on the architectures above.

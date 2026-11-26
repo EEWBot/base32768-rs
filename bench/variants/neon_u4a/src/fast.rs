@@ -35,48 +35,6 @@ unsafe fn put(dst: *mut u8, pos: usize, packed: u32) -> usize {
     pos + (packed >> 24) as usize
 }
 
-/// Encodes 15 bytes as 8 characters at `dst + pos` and returns the new
-/// position.
-///
-/// # Safety
-/// `dst + pos .. dst + pos + 25` must be writable.
-#[inline(always)]
-unsafe fn encode_chunk(chunk: &[u8; 15], dst: *mut u8, mut pos: usize) -> usize {
-    let hi = u64::from_be_bytes(chunk[0..8].try_into().unwrap());
-    let lo = u64::from_be_bytes(chunk[7..15].try_into().unwrap());
-
-    let c = [
-        scalar_barrier(z15_utf8((hi >> 49) as u32)),
-        scalar_barrier(z15_utf8((hi >> 34) as u32 & 0x7FFF)),
-        scalar_barrier(z15_utf8((hi >> 19) as u32 & 0x7FFF)),
-        scalar_barrier(z15_utf8((hi >> 4) as u32 & 0x7FFF)),
-        // `lo` starts at byte 7, so it already holds `hi`'s low 4 bits.
-        scalar_barrier(z15_utf8((lo >> 45) as u32 & 0x7FFF)),
-        scalar_barrier(z15_utf8((lo >> 30) as u32 & 0x7FFF)),
-        scalar_barrier(z15_utf8((lo >> 15) as u32 & 0x7FFF)),
-        scalar_barrier(z15_utf8(lo as u32 & 0x7FFF)),
-    ];
-
-    // SAFETY: the caller guarantees 25 writable bytes.
-    unsafe {
-        // Common case (~95% for random data): eight 3-byte characters, so
-        // every store has a fixed offset and none waits on the previous
-        // character's length. Lengths are 2 (0b10) or 3 (0b11), so the AND
-        // of all of them is 3 only if every one is 3.
-        if (c[0] & c[1] & c[2] & c[3] & c[4] & c[5] & c[6] & c[7]) >> 24 == 3 {
-            for (i, &packed) in c.iter().enumerate() {
-                put(dst, pos + 3 * i, packed);
-            }
-            pos += 24;
-        } else {
-            for &packed in &c {
-                pos = put(dst, pos, packed);
-            }
-        }
-    }
-    pos
-}
-
 /// At least 24 of the 32 15-bit values in the 60 bytes are below 224
 /// (2-byte characters).
 #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
@@ -236,14 +194,21 @@ fn encode_append<const LEVEL: u8>(b: &[u8], out: &mut Vec<u8>) {
     // path, which is faster for 3-byte characters than NEON.
     #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
     if LEVEL >= LEVEL_SIMD && b.len() >= 1024 && two_byte_dense_values(&b[..60]) {
-        // In its own function, as for decode.
+        // In its own function, like the 2-byte AVX-512 decode path, so that
+        // the scalar loop below compiles as without it.
         #[inline(never)]
         unsafe fn encode_neon_dense(b: &[u8], dst: *mut u8) -> (usize, usize) {
             let (mut done, mut pos) = (0, 0);
             while done + 32 <= b.len() {
-                let mut zs = [0u16; 16];
                 // SAFETY: 32 bytes are readable at `done`, and the 30 bytes
                 // encoded reserve 16 * 3 = 48 output bytes.
+                if unsafe { simd::encode16_2byte_short_neon(b.as_ptr().add(done), dst.add(pos)) } {
+                    pos += 32;
+                    done += 30;
+                    continue;
+                }
+                let mut zs = [0u16; 16];
+                // SAFETY: as above.
                 let n = unsafe {
                     simd::encode16_2byte_neon(b.as_ptr().add(done), dst.add(pos), zs.as_mut_ptr())
                 };
@@ -269,8 +234,38 @@ fn encode_append<const LEVEL: u8>(b: &[u8], out: &mut Vec<u8>) {
     // Fast path: 15 bytes -> 8 characters.
     let (chunks, remainder) = b[done..].as_chunks::<15>();
     for chunk in chunks {
+        let hi = u64::from_be_bytes(chunk[0..8].try_into().unwrap());
+        let lo = u64::from_be_bytes(chunk[7..15].try_into().unwrap());
+
+        let c = [
+            scalar_barrier(z15_utf8((hi >> 49) as u32)),
+            scalar_barrier(z15_utf8((hi >> 34) as u32 & 0x7FFF)),
+            scalar_barrier(z15_utf8((hi >> 19) as u32 & 0x7FFF)),
+            scalar_barrier(z15_utf8((hi >> 4) as u32 & 0x7FFF)),
+            // `lo` starts at byte 7, so it already holds `hi`'s low 4 bits.
+            scalar_barrier(z15_utf8((lo >> 45) as u32 & 0x7FFF)),
+            scalar_barrier(z15_utf8((lo >> 30) as u32 & 0x7FFF)),
+            scalar_barrier(z15_utf8((lo >> 15) as u32 & 0x7FFF)),
+            scalar_barrier(z15_utf8(lo as u32 & 0x7FFF)),
+        ];
+
         // SAFETY: at most 8 * 3 + 1 bytes per chunk; covered by the capacity.
-        pos = unsafe { encode_chunk(chunk, dst, pos) };
+        unsafe {
+            // Common case (~95% for random data): eight 3-byte characters, so
+            // every store has a fixed offset and none waits on the previous
+            // character's length. Lengths are 2 (0b10) or 3 (0b11), so the AND
+            // of all of them is 3 only if every one is 3.
+            if (c[0] & c[1] & c[2] & c[3] & c[4] & c[5] & c[6] & c[7]) >> 24 == 3 {
+                for (i, &packed) in c.iter().enumerate() {
+                    put(dst, pos + 3 * i, packed);
+                }
+                pos += 24;
+            } else {
+                for &packed in &c {
+                    pos = put(dst, pos, packed);
+                }
+            }
+        }
     }
 
     // Remaining 0..=14 bytes.
@@ -557,6 +552,10 @@ unsafe fn decode_fast<const SIMD: bool, const AVX512: bool, const DENSE: bool>(
     let len = bytes.len();
     let mut pos = 0usize;
     let mut written = 0usize;
+    // NEON windows that failed in a row, and 8-character groups left to the
+    // scalar path before the next try.
+    #[allow(unused_mut, unused_variables)]
+    let (mut fails, mut skip) = (0u32, 0u32);
 
     while pos + 24 <= len {
         #[cfg(target_arch = "x86_64")]
@@ -607,7 +606,9 @@ unsafe fn decode_fast<const SIMD: bool, const AVX512: bool, const DENSE: bool>(
             }
         }
         #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
-        if SIMD && pos + 48 <= len {
+        if SIMD && skip > 0 {
+            skip -= 1;
+        } else if SIMD && pos + 48 <= len {
             // 16 three-byte characters, or (in the dense instance only) 16
             // two-byte ones after a 2-byte lead.
             // SAFETY: `pos + 48 <= len`. Each group consumes at least 16
@@ -628,7 +629,14 @@ unsafe fn decode_fast<const SIMD: bool, const AVX512: bool, const DENSE: bool>(
             if groups == 2 {
                 pos += 2 * step;
                 written += 30;
+                fails = 0;
                 continue;
+            }
+            // Mixed widths in a row: leave the next groups to the scalar path.
+            fails += 1;
+            if fails >= 2 {
+                fails = 0;
+                skip = 4;
             }
             // The 8-character path below takes the rejected group.
             pos += step * groups;
@@ -1234,6 +1242,181 @@ mod tests {
         }
     }
 
+    /// Windows with exactly one 2-byte character, in every lane, followed
+    /// by a 2- or 3-byte character at byte 95 (the next window's first).
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn decode32_one_short_every_lane() {
+        if !(std::is_x86_feature_detected!("avx512bw")
+            && std::is_x86_feature_detected!("avx512vbmi")
+            && std::is_x86_feature_detected!("avx512vbmi2")
+            && std::is_x86_feature_detected!("avx512bitalg")
+            && std::is_x86_feature_detected!("bmi2")
+            && std::is_x86_feature_detected!("popcnt"))
+        {
+            return;
+        }
+        for k in 0..32 {
+            for next in [5u16, 3000] {
+                let values: [u16; 32] = core::array::from_fn(|i| {
+                    if i == k {
+                        100 + i as u16
+                    } else {
+                        300 + 999 * i as u16
+                    }
+                });
+                let expected = pack_z15(&values);
+                let head = encode_impl::<LEVEL_SCALAR>(&expected);
+                let next = encode_impl::<LEVEL_SCALAR>(&pack_z15(&[next; 8]));
+                let next = next.chars().next().unwrap();
+                let input = format!("{head}{next}{}", "㐀".repeat(16));
+                let mut out = [0xA5; 144];
+                // SAFETY: valid UTF-8 and a large enough output buffer.
+                let result =
+                    unsafe { crate::simd::decode32_windows(input.as_bytes(), out.as_mut_ptr()) };
+                assert_eq!(result, (head.len(), 60), "{k} {next}");
+                assert_eq!(&out[..60], expected, "{k} {next}");
+                // A 7-bit or invalid character as the short one.
+                for bad in ['ƀ', '߿'] {
+                    let pos = head.char_indices().nth(k).unwrap().0;
+                    let mut damaged = head.clone();
+                    damaged.replace_range(pos..pos + 2, &bad.to_string());
+                    let input = format!("{damaged}{next}{}", "㐀".repeat(16));
+                    let result = unsafe {
+                        crate::simd::decode32_windows(input.as_bytes(), out.as_mut_ptr())
+                    };
+                    assert_eq!(result, (0, 0), "{k} {bad:?}");
+                }
+            }
+        }
+    }
+
+    /// `decode32_windows` on the 32 values and what follows them, with
+    /// "\u{3400}" padding so that no second window starts. Returns the
+    /// result and the first 60 bytes written.
+    #[cfg(target_arch = "x86_64")]
+    fn one_window(values: &[u16; 32], next: &str) -> ((usize, usize), Vec<u8>) {
+        let head = encode_impl::<LEVEL_SCALAR>(&pack_z15(values));
+        let input = format!("{head}{next}{}", "\u{3400}".repeat(16));
+        let mut out = [0xA5; 144];
+        // SAFETY: valid UTF-8 and a large enough output buffer.
+        let result = unsafe { crate::simd::decode32_windows(input.as_bytes(), out.as_mut_ptr()) };
+        (result, out[..60].to_vec())
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn avx512_decode_available() -> bool {
+        std::is_x86_feature_detected!("avx512bw")
+            && std::is_x86_feature_detected!("avx512vbmi")
+            && std::is_x86_feature_detected!("avx512vbmi2")
+            && std::is_x86_feature_detected!("avx512bitalg")
+            && std::is_x86_feature_detected!("bmi2")
+            && std::is_x86_feature_detected!("popcnt")
+    }
+
+    /// Several 2-byte characters whose leads still leave `aligned` a run of
+    /// low ones (every lead from the first short character on is off the
+    /// fixed positions): the 95-byte path must reject them, and the general
+    /// path decodes them.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn decode32_several_short_contiguous_aligned() {
+        if !avx512_decode_available() {
+            return;
+        }
+        for k in 0..32 {
+            for others in [
+                vec![k + 1],
+                vec![k + 2],
+                vec![31],
+                vec![k + 1, k + 2],
+                vec![k + 3, 30],
+            ] {
+                let mut shorts = vec![k];
+                shorts.extend(others.into_iter().filter(|&j| j > k && j < 32));
+                shorts.dedup();
+                if shorts.len() < 2 {
+                    continue;
+                }
+                let values: [u16; 32] = core::array::from_fn(|i| {
+                    if shorts.contains(&i) {
+                        7 * i as u16
+                    } else {
+                        300 + 999 * i as u16
+                    }
+                });
+                let len = encode_impl::<LEVEL_SCALAR>(&pack_z15(&values)).len();
+                assert_eq!(len, 96 - shorts.len());
+                let count = || crate::simd::AVX512_ONE_SHORT.with(|n| n.get());
+                let before = count();
+                let (result, out) = one_window(&values, "");
+                assert_eq!(count(), before, "{shorts:?} took the 95-byte path");
+                assert_eq!(result, (len, 60), "{shorts:?}");
+                assert_eq!(out, pack_z15(&values), "{shorts:?}");
+            }
+        }
+    }
+
+    /// One 2-byte character, then a character at byte 95 that is ASCII, a
+    /// 4-byte character or a 7-bit (final) character: the window takes its
+    /// 95 bytes and leaves that character to the code after it.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn decode32_one_short_then_other_characters() {
+        if !avx512_decode_available() {
+            return;
+        }
+        for k in [0, 1, 15, 16, 30, 31] {
+            let values: [u16; 32] =
+                core::array::from_fn(|i| if i == k { 100 } else { 300 + 999 * i as u16 });
+            for next in ["A", "\u{10000}", "\u{180}"] {
+                let count = || crate::simd::AVX512_ONE_SHORT.with(|n| n.get());
+                let before = count();
+                let (result, out) = one_window(&values, next);
+                assert_eq!(count(), before + 1, "{k} {next:?}");
+                assert_eq!(result, (95, 60), "{k} {next:?}");
+                assert_eq!(out, pack_z15(&values), "{k} {next:?}");
+            }
+            // Whole inputs through the dispatch (at least 4096 bytes), the
+            // window after 43 windows of 3-byte characters: results and
+            // errors as in scalar code.
+            let mut all: Vec<u16> = (0..43 * 32).map(|i| 300 + (i % 30000) as u16).collect();
+            all.extend_from_slice(&values);
+            let head = encode_impl::<LEVEL_SCALAR>(&pack_z15(&all));
+            assert!(head.len() >= 4096);
+            for next in ["A", "\u{10000}", "\u{180}", "\u{3400}\u{180}"] {
+                let _ = decode_every_level(&format!("{head}{next}"));
+            }
+        }
+    }
+
+    /// Windows that alternate between one 2-byte character (95 bytes) and
+    /// none (96 bytes), through the dispatch: the 95-byte path runs.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn decode32_alternating_95_and_96() {
+        if !avx512_decode_available() {
+            return;
+        }
+        let values: Vec<u16> = (0..64 * 32)
+            .map(|i| {
+                let (block, lane) = (i / 32, i % 32);
+                if block % 2 == 0 && lane == block / 2 % 32 {
+                    50
+                } else {
+                    300 + (i * 7 % 30000) as u16
+                }
+            })
+            .collect();
+        let data = pack_z15(&values);
+        let encoded = encode_every_level(&data);
+        assert!(encoded.len() >= 4096);
+        let count = || crate::simd::AVX512_ONE_SHORT.with(|n| n.get());
+        let before = count();
+        assert_eq!(decode_every_level(&encoded).unwrap(), data);
+        assert!(count() - before >= 32, "{}", count() - before);
+    }
+
     /// Inputs of 2-byte characters with an invalid, 7-bit or 3-byte
     /// character in every position: every level agrees, on the 2-byte AVX-512
     /// path too.
@@ -1255,26 +1438,69 @@ mod tests {
         }
     }
 
-    /// The NEON paths run: 3-byte decode for random data, and the 2-byte
-    /// decode and encode paths for long inputs of 2-byte characters only.
+    /// Long inputs of mostly 2-byte characters (values below 224, not only
+    /// zeros), with values of 224 and above (3-byte characters, including
+    /// ones that differ from a 2-byte value in one bit) at every position:
+    /// every level agrees.
+    #[test]
+    fn two_byte_values_with_3byte_at_every_position() {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let base: Vec<u16> = (0..1600).map(|_| (next() % 224) as u16).collect();
+        let encoded = encode_every_level(&pack_z15(&base));
+        assert_eq!(decode_every_level(&encoded).unwrap(), pack_z15(&base));
+        for i in 0..64 {
+            for big in [224, 255, 256, 1 << (i % 15), 0x7FFF] {
+                let mut values = base.clone();
+                values[100 + i] = big.max(224);
+                let data = pack_z15(&values);
+                assert_eq!(
+                    decode_every_level(&encode_every_level(&data)).unwrap(),
+                    data
+                );
+            }
+        }
+    }
+
+    /// The NEON decode paths run: 3-byte windows for random data, and the
+    /// 2-byte path for long inputs of 2-byte characters only.
     #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
     #[test]
-    fn neon_paths_run() {
-        let count = |k: usize| crate::simd::NEON_WINDOWS.with(|n| n[k].get());
+    fn neon_decode_paths_run() {
+        let count = |k: usize| crate::simd::NEON_DECODE_WINDOWS.with(|n| n[k].get());
         let random = random_bytes(3000, 0x1234_5678);
         let encoded = encode_every_level(&random);
         let before = count(0);
         assert_eq!(decode_impl::<LEVEL_SIMD>(&encoded).unwrap(), random);
         assert!(count(0) > before);
-        // 500 bytes encode to 534 bytes, below the 1 KiB the 2-byte paths
-        // need.
+        // 500 bytes encode to 534 bytes, below the 1 KiB the path needs.
         for (len, used) in [(3000, true), (500, false)] {
             let zeros = vec![0u8; len];
-            let before = (count(1), count(2));
-            let encoded = encode_impl::<LEVEL_SIMD>(&zeros);
-            assert_eq!(count(2) > before.1, used, "encode {len}");
+            let encoded = encode_every_level(&zeros);
+            let before = count(1);
             assert_eq!(decode_impl::<LEVEL_SIMD>(&encoded).unwrap(), zeros);
-            assert_eq!(count(1) > before.0, used, "decode {len}");
+            assert_eq!(count(1) > before, used, "{len}");
+        }
+    }
+
+    /// The NEON 2-byte encode path runs for long inputs of 2-byte
+    /// characters only.
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    #[test]
+    fn neon_encode_path_runs() {
+        let windows = || crate::simd::NEON_ENCODE_WINDOWS.with(|n| n.get());
+        // 500 bytes are below the 1 KiB the path needs.
+        for (len, used) in [(3000, true), (500, false)] {
+            let zeros = vec![0u8; len];
+            let before = windows();
+            let encoded = encode_impl::<LEVEL_SIMD>(&zeros);
+            assert_eq!(windows() > before, used, "{len}");
+            assert_eq!(decode_impl::<LEVEL_SIMD>(&encoded).unwrap(), zeros);
         }
     }
 
