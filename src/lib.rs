@@ -138,11 +138,12 @@ fn encode_append<const LEVEL: u8>(b: &[u8], out: &mut Vec<u8>) {
     #[cfg(target_arch = "x86_64")]
     if LEVEL >= LEVEL_AVX512
         && b.len() >= 60
+        && std::is_x86_feature_detected!("popcnt")
         && std::is_x86_feature_detected!("avx512bw")
         && std::is_x86_feature_detected!("avx512vbmi")
         && std::is_x86_feature_detected!("avx512vbmi2")
     {
-        #[target_feature(enable = "avx512f,avx512bw,avx512vbmi,avx512vbmi2")]
+        #[target_feature(enable = "avx512f,avx512bw,avx512vbmi,avx512vbmi2,popcnt")]
         unsafe fn encode_avx512(b: &[u8], dst: *mut u8) -> (usize, usize) {
             let (mut done, mut pos) = (0, 0);
             // Two blocks per iteration (1.02-1.08x when 2-byte characters
@@ -550,6 +551,17 @@ unsafe fn decode_fast<const SIMD: bool, const AVX512: bool, const DENSE: bool>(
             pos += 24 * groups;
             written += 15 * groups;
         }
+        #[cfg(target_arch = "x86_64")]
+        if AVX512 && !DENSE && pos + 64 <= len {
+            // SAFETY: pos is a UTF-8 boundary with 64 readable bytes.
+            // Consuming at least 32 bytes reserves room for 30 decoded bytes.
+            let n = unsafe { simd::decode16_mixed_avx512(src.add(pos), dst.add(written)) };
+            if n != 0 {
+                pos += n;
+                written += 30;
+                continue;
+            }
+        }
         // SAFETY: `pos + 24 <= len`.
         let (v, n) = unsafe { read_8::<SIMD>(src.add(pos)) };
         if v.iter().fold(0, |a, &b| a | b) & FLAG7 != 0 {
@@ -918,39 +930,46 @@ mod simd {
 
     /// Encodes the 60 bytes at `src` as 32 characters at `d`, with table
     /// lookups only in registers, and returns the number of bytes written
-    /// (64..=96). Writes nothing past them.
+    /// (64..=96). May write up to 96 bytes.
     ///
     /// The code point of a 15-bit value z is
     /// `z + 0x2000 * (z >= 0xD40) + 32 * low`, where `low` depends only on
     /// the block `z >> 5`: byte `(ENCODE_START_BIASED[z >> 8] + (z >> 5)) % 128`
     /// of `ENCODE_OFFSET` (see build.rs).
     #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "avx512f,avx512bw,avx512vbmi,avx512vbmi2")]
+    #[target_feature(enable = "avx512f,avx512bw,avx512vbmi,avx512vbmi2,popcnt")]
     #[inline]
     pub unsafe fn encode32_avx512(src: *const u8, d: *mut u8) -> usize {
         use crate::table;
         use core::arch::x86_64::*;
 
-        /// vpermb indices: lane i = input bytes (j, j+1) or (j+1, j+2) as a
-        /// big-endian u16, where j = 15 * i / 8.
-        const fn unpack_idx(second: bool) -> [u8; 64] {
+        /// Each qword spans four 15-bit values. Reverse its eight input bytes.
+        const fn unpack_order() -> [u8; 64] {
             let mut m = [0u8; 64];
             let mut i = 0;
-            while i < 32 {
-                let j = 15 * i / 8 + second as usize;
-                m[2 * i] = (j + 1) as u8;
-                m[2 * i + 1] = j as u8;
+            while i < 64 {
+                m[i] = (60 * (i / 8) / 8 + 7 - i % 8) as u8;
                 i += 1;
             }
             m
         }
-        /// Shifts that line up value i (starting at bit 15 * i) in those u16s.
-        const fn unpack_shift(right: bool) -> [u16; 32] {
-            let mut m = [0u16; 32];
+        /// Extract the low and high bytes of each value. Alternate qwords
+        /// start four bits into the first byte.
+        const fn unpack_bits() -> [u8; 64] {
+            let mut m = [0u8; 64];
             let mut i = 0;
-            while i < 32 {
-                let o = (15 * i % 8) as u16;
-                m[i] = if right { 8 - o } else { o };
+            while i < 64 {
+                m[i] = (49 - 4 * (i / 8 % 2) - 15 * (i / 2 % 4) + 8 * (i % 2)) as u8;
+                i += 1;
+            }
+            m
+        }
+        /// Extract bits 12..15 and 6..11 of each code point into adjacent bytes.
+        const fn utf8_bits() -> [u8; 64] {
+            let mut m = [0u8; 64];
+            let mut i = 0;
+            while i < 64 {
+                m[i] = (16 * (i / 2 % 4) + if i % 2 == 0 { 12 } else { 6 }) as u8;
                 i += 1;
             }
             m
@@ -972,10 +991,9 @@ mod simd {
             }
             m
         }
-        static IDX_A: [u8; 64] = unpack_idx(false);
-        static IDX_B: [u8; 64] = unpack_idx(true);
-        static SHL: [u16; 32] = unpack_shift(false);
-        static SHR: [u16; 32] = unpack_shift(true);
+        static ORDER: [u8; 64] = unpack_order();
+        static BITS: [u8; 64] = unpack_bits();
+        static UTF8_BITS: [u8; 64] = utf8_bits();
         static OUT0: [u8; 64] = utf8_idx(0);
         static OUT1: [u8; 64] = utf8_idx(1);
         /// (b1, b2) of each of 32 characters.
@@ -1001,12 +1019,11 @@ mod simd {
         // 60 bytes -> 32 x 15-bit values. The masked load touches only 60 bytes.
         // SAFETY: the caller guarantees 60 readable bytes at `src`.
         let v = unsafe { _mm512_maskz_loadu_epi8((1 << 60) - 1, src.cast()) };
-        let x = _mm512_permutexvar_epi8(ld(IDX_A.as_ptr()), v);
-        let y = _mm512_permutexvar_epi8(ld(IDX_B.as_ptr()), v);
-        let z = _mm512_srli_epi16::<1>(_mm512_or_si512(
-            _mm512_sllv_epi16(x, ld(SHL.as_ptr().cast())),
-            _mm512_srlv_epi16(y, ld(SHR.as_ptr().cast())),
-        ));
+        let input = _mm512_permutexvar_epi8(ld(ORDER.as_ptr()), v);
+        let z = _mm512_and_si512(
+            _mm512_multishift_epi64_epi8(ld(BITS.as_ptr()), input),
+            w(0x7FFF),
+        );
 
         // z -> code point, in the high byte of each u16 lane: vpermi2b uses
         // the low 7 bits of each index byte, z >> 8 (the unit) for the start,
@@ -1022,15 +1039,13 @@ mod simd {
 
         // UTF-8 as 3 bytes per character; 2-byte characters get a leading 0,
         // the only zero byte (every other byte has its top bit set).
-        let two = _mm512_cmplt_epu16_mask(cp, w(0x800));
-        let b0 =
-            _mm512_maskz_mov_epi16(!two, _mm512_or_si512(_mm512_srli_epi16::<12>(cp), w(0xE0)));
-        let b1 = _mm512_or_si512(
-            _mm512_and_si512(_mm512_srli_epi16::<6>(cp), w(0x3F)),
-            _mm512_mask_blend_epi16(two, w(0x80), w(0xC0)),
-        );
+        // Only the first seven 32-character blocks use two bytes. Their
+        // code points also have zero in bits 12..15.
+        let two = _mm512_cmplt_epu16_mask(z, w(224));
+        let headers = _mm512_mask_blend_epi16(two, w(0x80E0u16 as i16), w(0xC000u16 as i16));
+        let bits = _mm512_multishift_epi64_epi8(ld(UTF8_BITS.as_ptr()), cp);
+        let pair = _mm512_ternarylogic_epi32::<0xF8>(headers, bits, w(0x3F0F));
         let b2 = _mm512_or_si512(_mm512_and_si512(cp, w(0x3F)), w(0x80));
-        let pair = _mm512_or_si512(b0, _mm512_slli_epi16::<8>(b1));
         let out0 = _mm512_permutex2var_epi8(pair, ld(OUT0.as_ptr()), b2);
         let out1 = _mm512_permutex2var_epi8(pair, ld(OUT1.as_ptr()), b2);
 
@@ -1055,23 +1070,18 @@ mod simd {
             unsafe { _mm512_storeu_si512(d.cast(), out) };
             return 64;
         }
-        // Squeeze out the zero bytes, but only in a 16-character half that has
-        // a 2-byte character: vpcompressb is slow.
-        let half = |out: __m512i, has_two: bool| -> (usize, __m512i) {
-            if has_two {
-                let m = _mm512_test_epi8_mask(out, out) & M48;
-                (m.count_ones() as usize, _mm512_maskz_compress_epi8(m, out))
-            } else {
-                (48, out)
-            }
+        // For a mixed block, each half may write all 48 bytes: the next
+        // half or block overwrites the spare bytes, within the reserved 96.
+        let compress = |out| {
+            let keep = _mm512_test_epi8_mask(out, out);
+            _mm512_maskz_compress_epi8(keep, out)
         };
-        let (n0, c0) = half(out0, two & 0xFFFF != 0);
-        let (n1, c1) = half(out1, two >> 16 != 0);
+        let n0 = 48 - (two as u16).count_ones() as usize;
         unsafe {
-            _mm512_mask_storeu_epi8(d.cast(), (1 << n0) - 1, c0);
-            _mm512_mask_storeu_epi8(d.add(n0).cast(), (1 << n1) - 1, c1);
+            _mm512_mask_storeu_epi8(d.cast(), M48, compress(out0));
+            _mm512_mask_storeu_epi8(d.add(n0).cast(), M48, compress(out1));
         }
-        n0 + n1
+        96 - two.count_ones() as usize
     }
 
     /// vpermb indices for packing decoded 15-bit values: output byte j =
@@ -1100,6 +1110,27 @@ mod simd {
             i += 1;
         }
         m
+    }
+
+    /// Pack 32 negated 15-bit values into the low 60 bytes. Each signed
+    /// multiply-add produces z[2i] << 15 | z[2i+1]. Rotating the four
+    /// dwords by 2, 4, 6 and 8 positions puts their wrapped bits where the
+    /// preceding dword needs them. PACK drops the last byte in each group.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx512f,avx512bw,avx512vbmi")]
+    #[inline]
+    unsafe fn pack_neg_z(neg_z: core::arch::x86_64::__m512i) -> core::arch::x86_64::__m512i {
+        use core::arch::x86_64::*;
+        static ROT: [u32; 16] = pack_shifts([2, 4, 6, 8]);
+        static WRAP: [u32; 16] = pack_shifts([3, 15, 63, 255]);
+        static PACK: [u8; 64] = pack_order();
+        // SAFETY: the three tables each contain 64 bytes.
+        let ld = |p: *const u8| unsafe { _mm512_loadu_si512(p.cast()) };
+        let pairs = _mm512_madd_epi16(neg_z, _mm512_set1_epi32(((-1i32) << 16) | 0x8000));
+        let rot = _mm512_rolv_epi32(pairs, ld(ROT.as_ptr().cast()));
+        let next = _mm512_shuffle_epi32::<0xF9>(rot);
+        let words = _mm512_ternarylogic_epi32::<0xCA>(ld(WRAP.as_ptr().cast()), next, rot);
+        _mm512_permutexvar_epi8(ld(PACK.as_ptr()), words)
     }
 
     /// Decodes up to 32 three-byte 15-bit characters at `p .. p + 96`.
@@ -1131,12 +1162,9 @@ mod simd {
         }
         static I01: [u8; 64] = char_bytes(false);
         static I2: [u8; 64] = char_bytes(true);
-        static PACK: [u8; 64] = pack_order();
-        static SHL: [u32; 16] = pack_shifts([2, 4, 6, 8]);
-        static SHR: [u32; 16] = pack_shifts([28, 26, 24, 32]);
         static HDESC: [u8; 128] = table::HALF_DESC_BIASED;
-        static VMASK: [u16; 32] = table::VALID_MASK;
-        static BOFF: [u16; 32] = table::BASE_OFFSET_BIASED;
+        static MISSING: [u16; 32] = table::MISSING_MASK;
+        static END_OFFSET: [u16; 32] = table::END_OFFSET_BIASED;
         // SAFETY (every use): `p` points to a 64-byte array or into the
         // readable input.
         let ld = |p: *const u8| unsafe { _mm512_loadu_si512(p.cast()) };
@@ -1172,31 +1200,23 @@ mod simd {
         );
         let cp = _mm512_ternarylogic_epi32::<0xF8>(_mm512_slli_epi16::<6>(t), b2, w(0x3F));
 
-        // z = cp - 32 * (non-15-bit blocks before the half page) - 32 *
-        // (non-15-bit blocks below this one in the half page).
-        let mask = _mm512_permutexvar_epi16(entry, ld(VMASK.as_ptr().cast()));
-        let offset = _mm512_permutexvar_epi16(entry, ld(BOFF.as_ptr().cast()));
-        let bit = _mm512_sllv_epi16(w(1), _mm512_and_si512(_mm512_srli_epi16::<5>(cp), w(15)));
-        let valid = lead_ok & _mm512_test_epi16_mask(mask, bit);
+        // The double shift uses bits 0..3 of the count, the block number
+        // within the half page. Bit zero of the result marks a missing block.
+        let mask = _mm512_permutexvar_epi16(entry, ld(MISSING.as_ptr().cast()));
+        let offset = _mm512_permutexvar_epi16(entry, ld(END_OFFSET.as_ptr().cast()));
+        let missing = _mm512_shrdv_epi16(mask, _mm512_setzero_si512(), _mm512_srli_epi16::<5>(cp));
+        let valid = lead_ok & _mm512_testn_epi16_mask(missing, w(1));
         // 8-character groups before the first rejected lane. With none, skip
         // the rest of the work (common when 2-byte characters are dense).
         let groups = (valid.trailing_ones() / 8) as usize;
         if groups == 0 {
             return 0;
         }
-        let base = _mm512_sub_epi16(cp, offset);
-        let holes = _mm512_popcnt_epi16(_mm512_andnot_si512(mask, _mm512_sub_epi16(bit, w(1))));
-        let z = _mm512_sub_epi16(base, _mm512_slli_epi16::<5>(holes));
-
-        // Pack: dword i = z[2i] << 15 | z[2i+1] (madd by -32768, -1, negated),
-        // then per 128-bit lane w_i = p_i << (2i+2) | p_{i+1} >> (28-2i).
-        let m = _mm512_madd_epi16(z, _mm512_set1_epi32(((-1i32) << 16) | 0x8000));
-        let pr = _mm512_sub_epi32(_mm512_setzero_si512(), m);
-        let words = _mm512_or_si512(
-            _mm512_sllv_epi32(pr, ld(SHL.as_ptr().cast())),
-            _mm512_srlv_epi32(_mm512_bsrli_epi128::<4>(pr), ld(SHR.as_ptr().cast())),
-        );
-        let out = _mm512_permutexvar_epi8(ld(PACK.as_ptr()), words);
+        // Count missing blocks back from the end of the half page. Keep
+        // -z so the signed madd coefficients produce a positive 30-bit pair.
+        let holes = _mm512_popcnt_epi16(missing);
+        let neg_z = _mm512_sub_epi16(_mm512_sub_epi16(offset, cp), _mm512_slli_epi16::<5>(holes));
+        let out = unsafe { pack_neg_z(neg_z) };
         #[cfg(test)]
         AVX512_BLOCKS.with(|n| n.set(n.get() + 1));
 
@@ -1211,6 +1231,76 @@ mod simd {
         groups
     }
 
+    /// Decode 16 mixed-width characters from 64 readable bytes, or leave
+    /// the caller at the original position for its usual error handling.
+    ///
+    /// # Safety
+    /// `p` must be at a character boundary in a valid UTF-8 string with at
+    /// least 64 readable bytes, and `d` must have 30 writable bytes.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx512f,avx512bw,avx512vbmi,avx512vbmi2")]
+    #[inline]
+    pub unsafe fn decode16_mixed_avx512(p: *const u8, d: *mut u8) -> usize {
+        use core::arch::x86_64::*;
+        // Source offsets and the next character's index, repeated once
+        // per output dword. Subtract 1, 2, 3 to read a character backwards.
+        const INDICES: ([u8; 64], [u8; 64]) = {
+            let mut seq = [0; 64];
+            let mut next = [0; 64];
+            let mut i = 0;
+            while i < 64 {
+                seq[i] = i as u8;
+                next[i] = (i / 4 + 1) as u8;
+                i += 1;
+            }
+            (seq, next)
+        };
+        static BLOCK: [u16; 2049] = crate::table::DECODE_MIXED_BLOCK;
+        let ld = |p: *const u8| unsafe { _mm512_loadu_si512(p.cast()) };
+
+        // SAFETY: the caller guarantees 64 readable input bytes.
+        let v = ld(p);
+        // A valid UTF-8 string containing only bytes in 0x80..0xEF has
+        // no ASCII or four-byte leads. The last character may be incomplete.
+        if _mm512_cmpge_epu8_mask(
+            _mm512_add_epi8(v, _mm512_set1_epi8(-128)),
+            _mm512_set1_epi8(0x70),
+        ) != 0
+        {
+            return 0;
+        }
+        let leads = _mm512_test_epi8_mask(v, _mm512_set1_epi8(0x40));
+        let starts = _mm512_maskz_compress_epi8(leads, ld(INDICES.0.as_ptr()));
+        let ends = _mm512_permutexvar_epi8(ld(INDICES.1.as_ptr()), starts);
+        let idx = _mm512_add_epi8(
+            ends,
+            _mm512_set1_epi32(i32::from_le_bytes([0xff, 0xfe, 0xfd, 0xfc])),
+        );
+        let bytes = _mm512_permutexvar_epi8(idx, v);
+        let w = |x| _mm512_set1_epi32(x);
+        // The final byte and its predecessor supply bits 0..11. A
+        // continuation in the penultimate position identifies a three-byte
+        // character, whose lead supplies the remaining four bits.
+        let three = _mm512_testn_epi32_mask(bytes, w(0x4000));
+        let high = _mm512_maskz_and_epi32(three, _mm512_srli_epi32::<4>(bytes), w(0xf000));
+        let mid = _mm512_ternarylogic_epi32::<0xf8>(high, _mm512_srli_epi32::<2>(bytes), w(0xfc0));
+        let cp = _mm512_ternarylogic_epi32::<0xf8>(mid, bytes, w(0x3f));
+        // SAFETY: cp is 16 bits. The final u16 of BLOCK pads the last
+        // dword gather. Subsequent operations use only its low 16 bits.
+        let base = unsafe {
+            _mm512_i32gather_epi32::<2>(_mm512_srli_epi32::<5>(cp), BLOCK.as_ptr().cast())
+        };
+        if _mm512_test_epi32_mask(base, w(0x8000)) != 0 {
+            return 0;
+        }
+        let z = _mm512_ternarylogic_epi32::<0xf8>(base, cp, w(31));
+        let z = _mm512_castsi256_si512(_mm512_cvtepi32_epi16(z));
+        let out = unsafe { pack_neg_z(_mm512_sub_epi16(_mm512_setzero_si512(), z)) };
+        // SAFETY: only the 30 packed bytes from the low 16 lanes are stored.
+        unsafe { _mm512_mask_storeu_epi8(d.cast(), (1 << 30) - 1, out) };
+        _mm_cvtsi128_si32(_mm512_extracti32x4_epi32::<1>(starts)) as u8 as usize
+    }
+
     /// Decodes up to 32 two-byte 15-bit characters at `p .. p + 64`. Returns
     /// how many leading 8-character groups (0..=4) hold only such
     /// characters; those groups are written to `d` as 15 bytes each, and
@@ -1222,9 +1312,20 @@ mod simd {
         use crate::table;
         use core::arch::x86_64::*;
 
-        static PACK: [u8; 64] = pack_order();
-        static SHL: [u32; 16] = pack_shifts([2, 4, 6, 8]);
-        static SHR: [u32; 16] = pack_shifts([28, 26, 24, 32]);
+        // Each value fits in eight bits. Its set bits occupy two output
+        // bytes of their own, except the eighth value which occupies one.
+        const fn pack_bytes() -> [u8; 64] {
+            let mut order = [0; 64];
+            let mut j = 0;
+            while j < 60 {
+                let i = j % 15;
+                order[j] = (16 * (j / 15) + if i == 14 { 14 } else { i ^ 1 }) as u8;
+                j += 1;
+            }
+            order
+        }
+        static PACK: [u8; 64] = pack_bytes();
+        static SHIFT: [[u16; 8]; 4] = [[1, 2, 3, 4, 5, 6, 7, 0]; 4];
         static BLOCK: [u8; 64] = table::DECODE_2BYTE_BLOCK;
         // SAFETY (every use): `p` points to a 64-byte array or to the 64
         // readable input bytes.
@@ -1254,13 +1355,7 @@ mod simd {
         // z = base | the continuation byte's low 5 bits (cp % 32).
         let z = _mm512_ternarylogic_epi32::<0xF8>(base, _mm512_srli_epi16::<8>(v), w(0x1F));
 
-        // Pack as in `decode32_avx512`.
-        let m = _mm512_madd_epi16(z, _mm512_set1_epi32(((-1i32) << 16) | 0x8000));
-        let pr = _mm512_sub_epi32(_mm512_setzero_si512(), m);
-        let words = _mm512_or_si512(
-            _mm512_sllv_epi32(pr, ld(SHL.as_ptr().cast())),
-            _mm512_srlv_epi32(_mm512_bsrli_epi128::<4>(pr), ld(SHR.as_ptr().cast())),
-        );
+        let words = _mm512_sllv_epi16(z, ld(SHIFT.as_ptr().cast()));
         let out = _mm512_permutexvar_epi8(ld(PACK.as_ptr()), words);
         #[cfg(test)]
         AVX512_2BYTE_BLOCKS.with(|n| n.set(n.get() + 1));
@@ -1800,6 +1895,51 @@ mod tests {
         }
     }
 
+    /// All 16-character width patterns, including the first character (whose
+    /// unused third-byte index wraps) and a rejected final repertoire block.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn mixed_decode_width_masks() {
+        if !(std::is_x86_feature_detected!("avx512bw")
+            && std::is_x86_feature_detected!("avx512vbmi")
+            && std::is_x86_feature_detected!("avx512vbmi2"))
+        {
+            return;
+        }
+        let filler = "㐀".repeat(16);
+        for widths in 0..=u16::MAX {
+            let values: [u16; 16] = core::array::from_fn(|i| {
+                if widths & (1 << i) == 0 {
+                    (13 * i) as u16
+                } else {
+                    (32767 - 173 * i) as u16
+                }
+            });
+            let expected = pack_z15(&values);
+            let mut input = encode_impl::<LEVEL_SCALAR>(&expected);
+            let consumed = input.len();
+            input.push_str(&filler);
+            let mut out = [0xA5; 31];
+            let n = unsafe { crate::simd::decode16_mixed_avx512(input.as_ptr(), out.as_mut_ptr()) };
+            assert_eq!(n, consumed);
+            assert_eq!(&out[..30], expected);
+            assert_eq!(out[30], 0xA5);
+        }
+        for c in ['A', 'ƀ', '￿', '𐀀'] {
+            for i in 0..16 {
+                let mut input = "Ҡ㐀".repeat(16);
+                let start = input.char_indices().nth(i).unwrap().0;
+                let end = input.char_indices().nth(i + 1).unwrap().0;
+                input.replace_range(start..end, &c.to_string());
+                let mut out = [0xA5; 30];
+                let n =
+                    unsafe { crate::simd::decode16_mixed_avx512(input.as_ptr(), out.as_mut_ptr()) };
+                assert_eq!(n, 0);
+                assert_eq!(out, [0xA5; 30]);
+            }
+        }
+    }
+
     /// Inputs of 2-byte characters with an invalid, 7-bit or 3-byte
     /// character in every position: every level agrees, on the 2-byte AVX-512
     /// path too.
@@ -1824,11 +1964,12 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn avx512_encode_path_runs() {
-        if !(std::is_x86_feature_detected!("avx512bw")
+        if !(std::is_x86_feature_detected!("popcnt")
+            && std::is_x86_feature_detected!("avx512bw")
             && std::is_x86_feature_detected!("avx512vbmi")
             && std::is_x86_feature_detected!("avx512vbmi2"))
         {
-            eprintln!("AVX-512 BW/VBMI/VBMI2 not available; skipped");
+            eprintln!("AVX-512 BW/VBMI/VBMI2 and POPCNT required; skipped");
             return;
         }
         let data: Vec<u8> = (0..3000).map(|i| (i * 7) as u8).collect();

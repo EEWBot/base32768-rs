@@ -217,6 +217,15 @@ fn main() {
         valid_mask[i] = mask;
         base_offset_biased[i] = offset.wrapping_add(0x2000);
     }
+    // Counting missing blocks from the current block through the end of
+    // its half page lets decode use the shifted mask for both membership
+    // (bit zero) and rank (population count).
+    let missing_mask: Vec<_> = valid_mask.iter().map(|mask| !mask).collect();
+    let end_offset: Vec<_> = base_offset_biased
+        .iter()
+        .zip(&missing_mask)
+        .map(|(base, mask)| base.wrapping_add(32 * mask.count_ones() as u16))
+        .collect();
     for cp in 0x800..0x10000u32 {
         let (b0, b1) = (0xE0 | cp >> 12, 0x80 | (cp >> 6 & 0x3F));
         let t = 64 * b0 + b1;
@@ -228,6 +237,13 @@ fn main() {
         if mask & bit != 0 {
             let holes = (!mask & (bit - 1)).count_ones();
             let z = cp_adj.wrapping_sub(base_offset_biased[i] as u32 + (holes << 5)) & 0xFFFF;
+            assert_eq!(z, decode[cp as usize] as u32, "U+{cp:04X}");
+            let suffix = missing_mask[i] >> bit.trailing_zeros();
+            assert_eq!(suffix & 1, 0);
+            let z = cp_adj
+                .wrapping_sub(end_offset[i] as u32)
+                .wrapping_add(32 * suffix.count_ones())
+                & 0xFFFF;
             assert_eq!(z, decode[cp as usize] as u32, "U+{cp:04X}");
         }
     }
@@ -323,6 +339,31 @@ fn main() {
         "DECODE_2BYTE_BLOCK",
         "u8",
         &decode_2byte_block,
+    );
+
+    write_array(
+        &mut out,
+        "/// Missing 15-bit blocks per half-page entry.",
+        "MISSING_MASK",
+        "u16",
+        &missing_mask,
+    );
+    write_array(
+        &mut out,
+        "/// Biased offset through the end of a half page.",
+        "END_OFFSET_BIASED",
+        "u16",
+        &end_offset,
+    );
+    // A dword gather reads each 16-bit entry and the one after it.
+    let mut mixed_block: Vec<_> = decode.iter().step_by(32).copied().collect();
+    mixed_block.push(0xFFFF);
+    write_array(
+        &mut out,
+        "/// First value per 32 code points, plus gather padding.",
+        "DECODE_MIXED_BLOCK",
+        "u16",
+        &mixed_block,
     );
 
     std::fs::write(
