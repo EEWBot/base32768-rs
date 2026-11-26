@@ -64,6 +64,48 @@ fn two_byte_dense_values(head: &[u8]) -> bool {
     count >= 24
 }
 
+/// The scalar code for 15 bytes -> 8 characters at `dst + pos`.
+///
+/// # Safety
+/// `dst + pos .. dst + pos + 25` must be writable.
+#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+#[inline(always)]
+unsafe fn encode_chunk(chunk: &[u8; 15], dst: *mut u8, mut pos: usize) -> usize {
+    let hi = u64::from_be_bytes(chunk[0..8].try_into().unwrap());
+    let lo = u64::from_be_bytes(chunk[7..15].try_into().unwrap());
+
+    let c = [
+        scalar_barrier(z15_utf8((hi >> 49) as u32)),
+        scalar_barrier(z15_utf8((hi >> 34) as u32 & 0x7FFF)),
+        scalar_barrier(z15_utf8((hi >> 19) as u32 & 0x7FFF)),
+        scalar_barrier(z15_utf8((hi >> 4) as u32 & 0x7FFF)),
+        // `lo` starts at byte 7, so it already holds `hi`'s low 4 bits.
+        scalar_barrier(z15_utf8((lo >> 45) as u32 & 0x7FFF)),
+        scalar_barrier(z15_utf8((lo >> 30) as u32 & 0x7FFF)),
+        scalar_barrier(z15_utf8((lo >> 15) as u32 & 0x7FFF)),
+        scalar_barrier(z15_utf8(lo as u32 & 0x7FFF)),
+    ];
+
+    // SAFETY: at most 8 * 3 + 1 bytes per chunk; covered by the capacity.
+    unsafe {
+        // Common case (~95% for random data): eight 3-byte characters, so
+        // every store has a fixed offset and none waits on the previous
+        // character's length. Lengths are 2 (0b10) or 3 (0b11), so the AND
+        // of all of them is 3 only if every one is 3.
+        if (c[0] & c[1] & c[2] & c[3] & c[4] & c[5] & c[6] & c[7]) >> 24 == 3 {
+            for (i, &packed) in c.iter().enumerate() {
+                put(dst, pos + 3 * i, packed);
+            }
+            pos += 24;
+        } else {
+            for &packed in &c {
+                pos = put(dst, pos, packed);
+            }
+        }
+    }
+    pos
+}
+
 /// Returns `x` unchanged. When AVX-512 is enabled at compile time (e.g.
 /// `-C target-cpu=native` on Zen 4/5 or Sapphire Rapids), LLVM turns the eight
 /// table lookups in `encode` into a `vpgatherqd` plus `vpextrd` stores, which
@@ -207,15 +249,10 @@ fn encode_append<const LEVEL: u8>(b: &[u8], out: &mut Vec<u8>) {
                     done += 30;
                     continue;
                 }
-                // Some 3-byte characters: the scalar table, from the values
-                // unpacked with NEON.
-                let mut zs = [0u16; 16];
-                // SAFETY: as above.
-                unsafe { simd::unpack16_neon(b.as_ptr().add(done), zs.as_mut_ptr()) };
-                for &z in &zs {
-                    // SAFETY: within the 48 bytes reserved, plus the spare
-                    // byte of the characters that follow.
-                    pos = unsafe { put(dst, pos, z15_utf8(z as u32)) };
+                // Some 3-byte characters: the scalar code, 15 bytes at a time.
+                for chunk in b[done..done + 30].as_chunks::<15>().0 {
+                    // SAFETY: as in the scalar path.
+                    pos = unsafe { encode_chunk(chunk, dst, pos) };
                 }
                 done += 30;
             }
@@ -604,24 +641,27 @@ unsafe fn decode_fast<const SIMD: bool, const AVX512: bool, const DENSE: bool>(
             // the 16th byte stored is within the capacity of the rest of
             // the 48 bytes.
             let two = DENSE && unsafe { *src.add(pos) } < 0xE0;
-            let groups = unsafe {
+            // Bytes taken: 16 characters in 32 (2-byte), 47 or 48 bytes, or
+            // the first 8 in 16 or 24.
+            let n = unsafe {
                 if two {
-                    simd::decode16_2byte_neon(src.add(pos), dst.add(written))
+                    16 * simd::decode16_2byte_neon(src.add(pos), dst.add(written))
                 } else {
                     simd::decode16_neon(src.add(pos), dst.add(written))
                 }
             };
-            let step = if two { 16 } else { 24 };
             // As for AVX-512, a whole window keeps the next position
             // independent of the vector computation.
-            if groups == 2 {
-                pos += 2 * step;
+            if n >= 32 {
+                pos += n;
                 written += 30;
                 continue;
             }
             // The 8-character path below takes the rejected group.
-            pos += step * groups;
-            written += 15 * groups;
+            if n != 0 {
+                pos += n;
+                written += 15;
+            }
         }
         // SAFETY: `pos + 24 <= len`.
         let (v, n) = unsafe { read_8::<SIMD>(src.add(pos)) };
@@ -1466,6 +1506,50 @@ mod tests {
             let before = count(1);
             assert_eq!(decode_impl::<LEVEL_SIMD>(&encoded).unwrap(), zeros);
             assert_eq!(count(1) > before, used, "{len}");
+        }
+    }
+
+    /// The 47-byte NEON window: one 2-byte character in each of the 16
+    /// lanes, followed by ASCII, a 4-byte, a 7-bit or a 3-byte character;
+    /// a 7-bit or invalid character as the short one; and two 2-byte
+    /// characters at every pair of lanes, which the path must leave to the
+    /// others. Every level agrees with scalar code.
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    #[test]
+    fn neon_one_short_windows() {
+        let count = || crate::simd::NEON_DECODE_WINDOWS.with(|n| n[2].get());
+        for k in 0..16 {
+            let values: [u16; 16] = core::array::from_fn(|i| {
+                if i == k {
+                    100 + i as u16
+                } else {
+                    300 + 999 * i as u16
+                }
+            });
+            let head = encode_impl::<LEVEL_SCALAR>(&pack_z15(&values));
+            assert_eq!(head.len(), 47);
+            for next in ["A", "\u{10000}", "\u{180}", "\u{3400}\u{3400}"] {
+                let before = count();
+                let _ = decode_every_level(&format!("{head}{next}"));
+                assert!(count() > before, "{k} {next:?}");
+            }
+            let pos = head.char_indices().nth(k).unwrap().0;
+            for bad in ['\u{180}', '\u{7FF}'] {
+                let mut damaged = head.clone();
+                damaged.replace_range(pos..pos + 2, &bad.to_string());
+                let before = count();
+                assert!(decode_every_level(&format!("{damaged}\u{3400}")).is_err());
+                assert_eq!(count(), before, "{k} {bad:?}");
+            }
+            for j in k + 1..16 {
+                let mut values = values;
+                values[j] = 7 * j as u16;
+                let head = encode_impl::<LEVEL_SCALAR>(&pack_z15(&values));
+                let before = count();
+                let data = decode_every_level(&format!("{head}{head}")).unwrap();
+                assert_eq!(&data[..30], pack_z15(&values));
+                assert_eq!(count(), before, "{k} {j}");
+            }
         }
     }
 

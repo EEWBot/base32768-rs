@@ -64,6 +64,48 @@ fn two_byte_dense_values(head: &[u8]) -> bool {
     count >= 24
 }
 
+/// The scalar code for 15 bytes -> 8 characters at `dst + pos`.
+///
+/// # Safety
+/// `dst + pos .. dst + pos + 25` must be writable.
+#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+#[inline(always)]
+unsafe fn encode_chunk(chunk: &[u8; 15], dst: *mut u8, mut pos: usize) -> usize {
+    let hi = u64::from_be_bytes(chunk[0..8].try_into().unwrap());
+    let lo = u64::from_be_bytes(chunk[7..15].try_into().unwrap());
+
+    let c = [
+        scalar_barrier(z15_utf8((hi >> 49) as u32)),
+        scalar_barrier(z15_utf8((hi >> 34) as u32 & 0x7FFF)),
+        scalar_barrier(z15_utf8((hi >> 19) as u32 & 0x7FFF)),
+        scalar_barrier(z15_utf8((hi >> 4) as u32 & 0x7FFF)),
+        // `lo` starts at byte 7, so it already holds `hi`'s low 4 bits.
+        scalar_barrier(z15_utf8((lo >> 45) as u32 & 0x7FFF)),
+        scalar_barrier(z15_utf8((lo >> 30) as u32 & 0x7FFF)),
+        scalar_barrier(z15_utf8((lo >> 15) as u32 & 0x7FFF)),
+        scalar_barrier(z15_utf8(lo as u32 & 0x7FFF)),
+    ];
+
+    // SAFETY: at most 8 * 3 + 1 bytes per chunk; covered by the capacity.
+    unsafe {
+        // Common case (~95% for random data): eight 3-byte characters, so
+        // every store has a fixed offset and none waits on the previous
+        // character's length. Lengths are 2 (0b10) or 3 (0b11), so the AND
+        // of all of them is 3 only if every one is 3.
+        if (c[0] & c[1] & c[2] & c[3] & c[4] & c[5] & c[6] & c[7]) >> 24 == 3 {
+            for (i, &packed) in c.iter().enumerate() {
+                put(dst, pos + 3 * i, packed);
+            }
+            pos += 24;
+        } else {
+            for &packed in &c {
+                pos = put(dst, pos, packed);
+            }
+        }
+    }
+    pos
+}
+
 /// Returns `x` unchanged. When AVX-512 is enabled at compile time (e.g.
 /// `-C target-cpu=native` on Zen 4/5 or Sapphire Rapids), LLVM turns the eight
 /// table lookups in `encode` into a `vpgatherqd` plus `vpextrd` stores, which
@@ -207,21 +249,10 @@ fn encode_append<const LEVEL: u8>(b: &[u8], out: &mut Vec<u8>) {
                     done += 30;
                     continue;
                 }
-                let mut zs = [0u16; 16];
-                // SAFETY: as above.
-                let n = unsafe {
-                    simd::encode16_2byte_neon(b.as_ptr().add(done), dst.add(pos), zs.as_mut_ptr())
-                };
-                if n != 0 {
-                    pos += n;
-                } else {
-                    // Some 3-byte characters: the scalar table, from the
-                    // values already unpacked.
-                    for &z in &zs {
-                        // SAFETY: within the 48 bytes reserved, plus the
-                        // spare byte of the characters that follow.
-                        pos = unsafe { put(dst, pos, z15_utf8(z as u32)) };
-                    }
+                // Some 3-byte characters: the scalar code, 15 bytes at a time.
+                for chunk in b[done..done + 30].as_chunks::<15>().0 {
+                    // SAFETY: as in the scalar path.
+                    pos = unsafe { encode_chunk(chunk, dst, pos) };
                 }
                 done += 30;
             }
