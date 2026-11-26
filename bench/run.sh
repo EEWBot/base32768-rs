@@ -14,7 +14,7 @@ rm -rf "$H"; mkdir -p "$H"
 cp -r "$ROOT/bench/harness/." "$H/"
 for v in old new; do
   mkdir -p "$H/$v"
-  (cd "$ROOT" && git ls-files -z -- Cargo.toml src base32768-table | xargs -0 tar -cf -) | tar -xf - -C "$H/$v"
+  (cd "$ROOT" && git ls-files -z -- Cargo.toml src base32768-table test-resources | xargs -0 tar -cf -) | tar -xf - -C "$H/$v"
   sed -i.bak "s/^name = \"base32768\"/name = \"base32768-$v\"/; s/^base32768-table = { path = \"base32768-table\" }/base32768-table = { path = \"base32768-table\", package = \"base32768-table-$v\" }/; /^\[workspace\]/,/^members/d" "$H/$v/Cargo.toml"
   sed -i.bak "s/^name = \"base32768-table\"/name = \"base32768-table-$v\"/" "$H/$v/base32768-table/Cargo.toml"
   sed -i.bak '/^\[dev-dependencies\]/,$d' "$H/$v/Cargo.toml"

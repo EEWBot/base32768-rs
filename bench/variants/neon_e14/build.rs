@@ -63,6 +63,56 @@ fn write_array<T: std::fmt::LowerHex>(
     writeln!(out, "];").unwrap();
 }
 
+/// Overlaps the 8-byte patterns of the 128 units into one string of at most
+/// 128 bytes (greedy shortest common superstring) and returns it, padded to
+/// 128 bytes, with each unit's start biased by -8u (mod 128).
+fn overlap_units(unit: &dyn Fn(u32) -> Vec<u8>) -> (Vec<u8>, Vec<u8>) {
+    let mut strings: Vec<Vec<u8>> = vec![];
+    for u in 0..128 {
+        let p = unit(u);
+        if !strings.contains(&p) {
+            strings.push(p);
+        }
+    }
+    // Greedy shortest common superstring: merge the pair with the longest
+    // overlap until one string is left.
+    let overlap = |a: &[u8], b: &[u8]| -> usize {
+        (0..=a.len().min(b.len()))
+            .rev()
+            .find(|&k| a[a.len() - k..] == b[..k])
+            .unwrap()
+    };
+    while strings.len() > 1 {
+        let mut best = (0, 1, 0);
+        for i in 0..strings.len() {
+            for j in 0..strings.len() {
+                if i != j {
+                    let k = overlap(&strings[i], &strings[j]);
+                    if k >= best.2 {
+                        best = (i, j, k);
+                    }
+                }
+            }
+        }
+        let (i, j, k) = best;
+        let mut merged = strings[i].clone();
+        merged.extend_from_slice(&strings[j][k..]);
+        strings.remove(i.max(j));
+        strings.remove(i.min(j));
+        strings.push(merged);
+    }
+    let mut string = strings.pop().unwrap();
+    assert!(string.len() <= 128, "{} bytes", string.len());
+    let mut start = vec![0u8; 128];
+    for u in 0..128u32 {
+        let p = unit(u);
+        let s = string.windows(8).position(|w| w == &p[..]).unwrap() as u32;
+        start[u as usize] = (s.wrapping_sub(8 * u) & 127) as u8;
+    }
+    string.resize(128, 0);
+    (string, start)
+}
+
 fn main() {
     let z15_blocks = ranges_to_blocks(Z15_CHAR_RANGES);
     let z7_blocks = ranges_to_blocks(Z7_CHAR_RANGES);
@@ -127,49 +177,7 @@ fn main() {
             .map(|b| u8::try_from(d_of(u << 8 | b << 5) - high(u << 8 | b << 5)).unwrap())
             .collect()
     };
-    let mut strings: Vec<Vec<u8>> = vec![];
-    for u in 0..128 {
-        let p = unit_lows(u);
-        if !strings.contains(&p) {
-            strings.push(p);
-        }
-    }
-    // Greedy shortest common superstring: merge the pair with the longest
-    // overlap until one string is left.
-    let overlap = |a: &[u8], b: &[u8]| -> usize {
-        (0..=a.len().min(b.len()))
-            .rev()
-            .find(|&k| a[a.len() - k..] == b[..k])
-            .unwrap()
-    };
-    while strings.len() > 1 {
-        let mut best = (0, 1, 0);
-        for i in 0..strings.len() {
-            for j in 0..strings.len() {
-                if i != j {
-                    let k = overlap(&strings[i], &strings[j]);
-                    if k >= best.2 {
-                        best = (i, j, k);
-                    }
-                }
-            }
-        }
-        let (i, j, k) = best;
-        let mut merged = strings[i].clone();
-        merged.extend_from_slice(&strings[j][k..]);
-        strings.remove(i.max(j));
-        strings.remove(i.min(j));
-        strings.push(merged);
-    }
-    let mut encode_offset = strings.pop().unwrap();
-    assert!(encode_offset.len() <= 128, "{} bytes", encode_offset.len());
-    let mut encode_start = vec![0u8; 128];
-    for u in 0..128u32 {
-        let p = unit_lows(u);
-        let start = encode_offset.windows(8).position(|w| w == &p[..]).unwrap() as u32;
-        encode_start[u as usize] = (start.wrapping_sub(8 * u) & 127) as u8;
-    }
-    encode_offset.resize(128, 0);
+    let (encode_offset, encode_start) = overlap_units(&unit_lows);
     for z in 0..0x8000u32 {
         let idx = (encode_start[(z >> 8) as usize] as u32 + (z >> 5 & 0xFF)) & 127;
         let low = encode_offset[idx as usize] as u32;
@@ -208,6 +216,20 @@ fn main() {
         let slot = (encode_start[(z >> 8) as usize] as u32 + (z >> 5 & 0xFF)) & 127;
         let offset = encode_offset_dict[(encode_offset_ids[slot as usize] & 63) as usize];
         let cp = (z + offset as u32) & 0xFFFF;
+        assert_eq!(cp, z15_cps[z as usize], "z {z:#x}");
+    }
+    // NEON encode: L = (D + 32) % 256 as an i8, with D = (cp - z) / 32,
+    // overlapped per unit as above. 2-byte characters have D in 37..=56 and
+    // 3-byte ones in 121..=323, so cp = z + 32 * L - 0x400 for z < 224 and
+    // z + 32 * L + 0x1C00 otherwise.
+    let unit_l =
+        |u: u32| -> Vec<u8> { (0..8).map(|b| (d_of(u << 8 | b << 5) + 32) as u8).collect() };
+    let (neon_encode_l, neon_encode_start) = overlap_units(&unit_l);
+    for z in 0..0x8000u32 {
+        let idx = (neon_encode_start[(z >> 8) as usize] as u32 + (z >> 5 & 0xFF)) & 127;
+        let l = neon_encode_l[idx as usize] as i8 as i32;
+        let adj = if z < 224 { -0x400 } else { 0x1C00 };
+        let cp = (z as i32 + 32 * l + adj) as u32 & 0xFFFF;
         assert_eq!(cp, z15_cps[z as usize], "z {z:#x}");
     }
 
@@ -414,6 +436,20 @@ fn main() {
         "ENCODE_2BYTE_PREFIX",
         "u16",
         &encode_2byte_prefix,
+    );
+    write_array(
+        &mut out,
+        "/// NEON encode: per 8-block unit, start in `NEON_ENCODE_L` - 8 * unit (mod 128).",
+        "NEON_ENCODE_START",
+        "u8",
+        &neon_encode_start,
+    );
+    write_array(
+        &mut out,
+        "/// NEON encode: (D + 32) % 256 per block (see build.rs), shared between units.",
+        "NEON_ENCODE_L",
+        "u8",
+        &neon_encode_l,
     );
     write_array(
         &mut out,

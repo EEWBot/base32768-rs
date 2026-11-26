@@ -1040,6 +1040,141 @@ pub unsafe fn code_points_8x3(p: *const u8) -> Option<[u16; 8]> {
     Some(out)
 }
 
+/// Whether `encode16_neon` takes blocks of 2-byte characters (else 0).
+#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+const ENCODE_2BYTE: bool = true;
+
+/// Encodes the 30 bytes at `src` (32 are read) as 16 characters at `d`.
+/// Returns the number of bytes written: 48 if all are 3-byte characters,
+/// 32 if all are 2-byte ones, or 0 (nothing written) for a mix.
+///
+/// The code point of z is `z + 32 * L + (z < 224 ? -0x400 : 0x1C00)`, with
+/// the i8 `L` of the block z >> 5 at
+/// `NEON_ENCODE_L[(NEON_ENCODE_START[z >> 8] + (z >> 5)) % 128]`.
+#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+#[target_feature(enable = "neon")]
+#[inline]
+pub unsafe fn encode16_neon(src: *const u8, d: *mut u8) -> usize {
+    use crate::table;
+    use core::arch::aarch64::*;
+
+    /// tbl indices of u16 lane i of half h (15 bytes from byte 15h): bytes
+    /// (j, j + 1) as a big-endian u16, or byte j + 2 in the high byte (y),
+    /// where j = 15h + 15i / 8. 0xFF reads as zero.
+    const fn unpack(h: usize, y: bool) -> [u8; 16] {
+        let mut m = [0xFFu8; 16];
+        let mut i = 0;
+        while i < 8 {
+            let j = 15 * h + 15 * i / 8;
+            if y {
+                m[2 * i + 1] = (j + 2) as u8;
+            } else {
+                m[2 * i] = (j + 1) as u8;
+                m[2 * i + 1] = j as u8;
+            }
+            i += 1;
+        }
+        m
+    }
+    /// Shifts of x (bit offset 15i % 8 of value i in byte j), and of y.
+    const fn shifts(y: bool) -> [i16; 8] {
+        let mut s = [0i16; 8];
+        let mut i = 0;
+        while i < 8 {
+            s[i] = (15 * i % 8) as i16 - if y { 16 } else { 0 };
+            i += 1;
+        }
+        s
+    }
+    static X0: [u8; 16] = unpack(0, false);
+    static Y0: [u8; 16] = unpack(0, true);
+    static X1: [u8; 16] = unpack(1, false);
+    static Y1: [u8; 16] = unpack(1, true);
+    static SHX: [i16; 8] = shifts(false);
+    static SHY: [i16; 8] = shifts(true);
+    static START: [u8; 128] = table::NEON_ENCODE_START;
+    static L: [u8; 128] = table::NEON_ENCODE_L;
+    let dup = vdupq_n_u8;
+
+    // SAFETY: the caller guarantees 32 readable bytes at `src`; the tables
+    // are read within their lengths.
+    let (input, shx, shy, start_t, l_t) = unsafe {
+        (
+            vld1q_u8_x2(src),
+            vld1q_s16(SHX.as_ptr()),
+            vld1q_s16(SHY.as_ptr()),
+            [
+                vld1q_u8_x4(START.as_ptr()),
+                vld1q_u8_x4(START.as_ptr().add(64)),
+            ],
+            [vld1q_u8_x4(L.as_ptr()), vld1q_u8_x4(L.as_ptr().add(64))],
+        )
+    };
+    // z = (x << r | y >> (16 - r)) >> 1: bits r..r + 15 of bytes j..j + 2.
+    let unpack_half = |xi: &[u8; 16], yi: &[u8; 16]| {
+        // SAFETY: both index tables are 16 bytes.
+        let (xi, yi) = unsafe { (vld1q_u8(xi.as_ptr()), vld1q_u8(yi.as_ptr())) };
+        let x = vreinterpretq_u16_u8(vqtbl2q_u8(input, xi));
+        let y = vreinterpretq_u16_u8(vqtbl2q_u8(input, yi));
+        vshrq_n_u16::<1>(vorrq_u16(vshlq_u16(x, shx), vshlq_u16(y, shy)))
+    };
+    let z0 = unpack_half(&X0, &Y0);
+    let z1 = unpack_half(&X1, &Y1);
+
+    // 2-byte characters are the first 7 blocks.
+    let two = vcombine_u8(
+        vmovn_u16(vcltq_u16(z0, vdupq_n_u16(224))),
+        vmovn_u16(vcltq_u16(z1, vdupq_n_u16(224))),
+    );
+    let all_two = vminvq_u8(two) != 0;
+    if vmaxvq_u8(two) != 0 && !(ENCODE_2BYTE && all_two) {
+        return 0;
+    }
+
+    // The block's L: unit z >> 8 (0..=127) selects the start, then
+    // start + (z >> 5) % 256 (mod 128) the byte.
+    let unit = vcombine_u8(vshrn_n_u16::<8>(z0), vshrn_n_u16::<8>(z1));
+    let block = vcombine_u8(vshrn_n_u16::<5>(z0), vshrn_n_u16::<5>(z1));
+    let lookup =
+        |t: &[uint8x16x4_t; 2], i| vqtbx4q_u8(vqtbl4q_u8(t[0], i), t[1], vsubq_u8(i, dup(64)));
+    let start = lookup(&start_t, unit);
+    let l = vreinterpretq_s8_u8(lookup(&l_t, vandq_u8(vaddq_u8(start, block), dup(127))));
+    let adj = vdupq_n_u16(if all_two { 0xFC00 } else { 0x1C00 });
+    let cp0 = vaddq_u16(
+        vaddq_u16(z0, adj),
+        vreinterpretq_u16_s16(vshll_n_s8::<5>(vget_low_s8(l))),
+    );
+    let cp1 = vaddq_u16(
+        vaddq_u16(z1, adj),
+        vreinterpretq_u16_s16(vshll_high_n_s8::<5>(l)),
+    );
+
+    let lo = vcombine_u8(vmovn_u16(cp0), vmovn_u16(cp1));
+    // 10cccccc of the low 6 bits.
+    let b_last = vbslq_u8(dup(0x3F), lo, dup(0x80));
+    if all_two {
+        // 110aaaaa 10cccccc.
+        let b0 = vorrq_u8(
+            vcombine_u8(vshrn_n_u16::<6>(cp0), vshrn_n_u16::<6>(cp1)),
+            dup(0xC0),
+        );
+        // SAFETY: the caller guarantees 48 writable bytes at `d`.
+        unsafe { vst2q_u8(d, uint8x16x2_t(b0, b_last)) };
+        return 32;
+    }
+    // 1110aaaa 10bbbbbb 10cccccc.
+    let hi = vcombine_u8(vshrn_n_u16::<8>(cp0), vshrn_n_u16::<8>(cp1));
+    let b0 = vorrq_u8(vshrq_n_u8::<4>(hi), dup(0xE0));
+    let b1 = vbslq_u8(
+        dup(0x3F),
+        vsliq_n_u8::<2>(vshrq_n_u8::<6>(lo), hi),
+        dup(0x80),
+    );
+    // SAFETY: as above.
+    unsafe { vst3q_u8(d, uint8x16x3_t(b0, b1, b_last)) };
+    48
+}
+
 /// Packs eight 15-bit values (u16 lanes) into the first 15 bytes.
 #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
 #[target_feature(enable = "neon")]
