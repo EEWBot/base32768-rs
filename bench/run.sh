@@ -1,7 +1,7 @@
 #!/bin/bash
 # Benchmarks each variant in bench/variants against the commit it is checked
 # out with: `old` is the repository's crate, `new` the same crate with the
-# variant's lib.rs (and build.rs, if any). Prints the new/old speedup per
+# variant's files in src/ (and build.rs, if any) replacing the crate's. Prints the new/old speedup per
 # dataset for 3 runs each, plus a HEAD vs HEAD control.
 # usage: bench/run.sh [variant...]
 set -euo pipefail
@@ -19,7 +19,7 @@ for v in old new; do
   sed -i.bak "s/^name = \"base32768-table\"/name = \"base32768-table-$v\"/" "$H/$v/base32768-table/Cargo.toml"
   sed -i.bak '/^\[dev-dependencies\]/,$d' "$H/$v/Cargo.toml"
 done
-cp "$H/new/src/lib.rs" "$H/head_lib.rs"
+cp -r "$H/new/src" "$H/head_src"
 cp "$H/new/base32768-table/build.rs" "$H/head_build.rs"
 
 ratios() {
@@ -32,10 +32,10 @@ ratios() {
 
 run_variant() {
   local name=$1 dir=$2
-  cp "$H/head_lib.rs" "$H/new/src/lib.rs"
+  rm -rf "$H/new/src"; cp -r "$H/head_src" "$H/new/src"
   cp "$H/head_build.rs" "$H/new/base32768-table/build.rs"
   if [ -n "$dir" ]; then
-    cp "$dir/lib.rs" "$H/new/src/lib.rs"
+    cp "$dir"/src/*.rs "$H/new/src/"
     [ -f "$dir/build.rs" ] && cp "$dir/build.rs" "$H/new/base32768-table/build.rs"
   fi
   echo "=================== $name"
