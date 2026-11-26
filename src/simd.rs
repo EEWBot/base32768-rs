@@ -631,6 +631,49 @@ pub unsafe fn decode32_windows(bytes: &[u8], dst: *mut u8) -> (usize, usize) {
     // 96-byte window checked in the loop condition.
     let ld = |p: *const u8| unsafe { _mm512_loadu_si512(p.cast()) };
     let w = |x: i16| _mm512_set1_epi16(x);
+    /// Exactly one 2-byte character, k: the 3-byte leads at 3i form the
+    /// low k bits of `aligned`, and characters k.. start one byte early, at
+    /// the fixed indices minus 1 (index 96, byte 64, minus 1 is 95, byte
+    /// 63, through the overlap of the two loads). Checks that every other
+    /// lead is a 3-byte lead and character k's a 2-byte lead, which with
+    /// valid UTF-8 fixes all 32 lengths; the window then takes 95 bytes.
+    #[target_feature(enable = "avx512f,avx512bw,avx512vbmi")]
+    #[inline]
+    unsafe fn one_short(a: __m512i, b: __m512i, aligned: u32) -> Option<(__m512i, __m512i, usize)> {
+        let w = |x: i16| _mm512_set1_epi16(x);
+        let short = aligned.wrapping_add(1);
+        if aligned & short != 0 {
+            return None;
+        }
+        let shifted = !aligned;
+        // SAFETY: the tables have 64 bytes.
+        let (first, last) = unsafe {
+            (
+                _mm512_loadu_si512(FIXED.0.as_ptr().cast()),
+                _mm512_loadu_si512(FIXED.1.as_ptr().cast()),
+            )
+        };
+        let first_idx = _mm512_mask_sub_epi16(first, shifted, first, w(0x0101));
+        let last_idx = _mm512_mask_sub_epi16(last, shifted, last, w(0x0101));
+        let preceding = _mm512_permutex2var_epi8(a, first_idx, b);
+        let three_ok = _mm512_cmpeq_epi16_mask(
+            _mm512_and_si512(preceding, w(0xF000u16 as i16)),
+            w(0xE000u16 as i16),
+        );
+        let two_ok = _mm512_cmpeq_epi16_mask(_mm512_and_si512(preceding, w(0x00E0)), w(0x00C0));
+        if (three_ok | short) != u32::MAX || two_ok & short == 0 {
+            return None;
+        }
+        // As in the general path: a synthetic 3-byte prefix.
+        let prefix = _mm512_mask_mov_epi16(
+            preceding,
+            short,
+            _mm512_or_si512(preceding, w(0xFF00u16 as i16)),
+        );
+        #[cfg(test)]
+        AVX512_ONE_SHORT.with(|n| n.set(n.get() + 1));
+        Some((prefix, _mm512_permutex2var_epi8(a, last_idx, b), 95))
+    }
     let (mut pos, mut written) = (0, 0);
     while bytes.len() - pos >= 96 {
         let p = unsafe { bytes.as_ptr().add(pos) };
@@ -660,6 +703,8 @@ pub unsafe fn decode32_windows(bytes: &[u8], dst: *mut u8) -> (usize, usize) {
                 _mm512_permutex2var_epi8(a, ld(FIXED.1.as_ptr()), b),
                 96,
             )
+        } else if let Some(one) = unsafe { one_short(a, b, aligned) } {
+            one
         } else {
             // With valid UTF-8, all bytes in 0x80..0xEF implies only
             // two- and three-byte characters. On rejection the caller
@@ -869,6 +914,9 @@ thread_local! {
     /// Number of 32-character blocks the 2-byte AVX-512 decode path
     /// processed on this thread.
     pub static AVX512_2BYTE_BLOCKS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+    /// Number of 95-byte windows (one 2-byte character) `decode32_windows`
+    /// took on this thread.
+    pub static AVX512_ONE_SHORT: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
     /// Number of 60-byte blocks the AVX-512 path encoded on this thread.
     pub static AVX512_ENCODE_BLOCKS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
     /// Number of 16-character halves the AVX2 encode path stored as all

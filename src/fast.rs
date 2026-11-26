@@ -1229,6 +1229,181 @@ mod tests {
         }
     }
 
+    /// Windows with exactly one 2-byte character, in every lane, followed
+    /// by a 2- or 3-byte character at byte 95 (the next window's first).
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn decode32_one_short_every_lane() {
+        if !(std::is_x86_feature_detected!("avx512bw")
+            && std::is_x86_feature_detected!("avx512vbmi")
+            && std::is_x86_feature_detected!("avx512vbmi2")
+            && std::is_x86_feature_detected!("avx512bitalg")
+            && std::is_x86_feature_detected!("bmi2")
+            && std::is_x86_feature_detected!("popcnt"))
+        {
+            return;
+        }
+        for k in 0..32 {
+            for next in [5u16, 3000] {
+                let values: [u16; 32] = core::array::from_fn(|i| {
+                    if i == k {
+                        100 + i as u16
+                    } else {
+                        300 + 999 * i as u16
+                    }
+                });
+                let expected = pack_z15(&values);
+                let head = encode_impl::<LEVEL_SCALAR>(&expected);
+                let next = encode_impl::<LEVEL_SCALAR>(&pack_z15(&[next; 8]));
+                let next = next.chars().next().unwrap();
+                let input = format!("{head}{next}{}", "㐀".repeat(16));
+                let mut out = [0xA5; 144];
+                // SAFETY: valid UTF-8 and a large enough output buffer.
+                let result =
+                    unsafe { crate::simd::decode32_windows(input.as_bytes(), out.as_mut_ptr()) };
+                assert_eq!(result, (head.len(), 60), "{k} {next}");
+                assert_eq!(&out[..60], expected, "{k} {next}");
+                // A 7-bit or invalid character as the short one.
+                for bad in ['ƀ', '߿'] {
+                    let pos = head.char_indices().nth(k).unwrap().0;
+                    let mut damaged = head.clone();
+                    damaged.replace_range(pos..pos + 2, &bad.to_string());
+                    let input = format!("{damaged}{next}{}", "㐀".repeat(16));
+                    let result = unsafe {
+                        crate::simd::decode32_windows(input.as_bytes(), out.as_mut_ptr())
+                    };
+                    assert_eq!(result, (0, 0), "{k} {bad:?}");
+                }
+            }
+        }
+    }
+
+    /// `decode32_windows` on the 32 values and what follows them, with
+    /// "\u{3400}" padding so that no second window starts. Returns the
+    /// result and the first 60 bytes written.
+    #[cfg(target_arch = "x86_64")]
+    fn one_window(values: &[u16; 32], next: &str) -> ((usize, usize), Vec<u8>) {
+        let head = encode_impl::<LEVEL_SCALAR>(&pack_z15(values));
+        let input = format!("{head}{next}{}", "\u{3400}".repeat(16));
+        let mut out = [0xA5; 144];
+        // SAFETY: valid UTF-8 and a large enough output buffer.
+        let result = unsafe { crate::simd::decode32_windows(input.as_bytes(), out.as_mut_ptr()) };
+        (result, out[..60].to_vec())
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn avx512_decode_available() -> bool {
+        std::is_x86_feature_detected!("avx512bw")
+            && std::is_x86_feature_detected!("avx512vbmi")
+            && std::is_x86_feature_detected!("avx512vbmi2")
+            && std::is_x86_feature_detected!("avx512bitalg")
+            && std::is_x86_feature_detected!("bmi2")
+            && std::is_x86_feature_detected!("popcnt")
+    }
+
+    /// Several 2-byte characters whose leads still leave `aligned` a run of
+    /// low ones (every lead from the first short character on is off the
+    /// fixed positions): the 95-byte path must reject them, and the general
+    /// path decodes them.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn decode32_several_short_contiguous_aligned() {
+        if !avx512_decode_available() {
+            return;
+        }
+        for k in 0..32 {
+            for others in [
+                vec![k + 1],
+                vec![k + 2],
+                vec![31],
+                vec![k + 1, k + 2],
+                vec![k + 3, 30],
+            ] {
+                let mut shorts = vec![k];
+                shorts.extend(others.into_iter().filter(|&j| j > k && j < 32));
+                shorts.dedup();
+                if shorts.len() < 2 {
+                    continue;
+                }
+                let values: [u16; 32] = core::array::from_fn(|i| {
+                    if shorts.contains(&i) {
+                        7 * i as u16
+                    } else {
+                        300 + 999 * i as u16
+                    }
+                });
+                let len = encode_impl::<LEVEL_SCALAR>(&pack_z15(&values)).len();
+                assert_eq!(len, 96 - shorts.len());
+                let count = || crate::simd::AVX512_ONE_SHORT.with(|n| n.get());
+                let before = count();
+                let (result, out) = one_window(&values, "");
+                assert_eq!(count(), before, "{shorts:?} took the 95-byte path");
+                assert_eq!(result, (len, 60), "{shorts:?}");
+                assert_eq!(out, pack_z15(&values), "{shorts:?}");
+            }
+        }
+    }
+
+    /// One 2-byte character, then a character at byte 95 that is ASCII, a
+    /// 4-byte character or a 7-bit (final) character: the window takes its
+    /// 95 bytes and leaves that character to the code after it.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn decode32_one_short_then_other_characters() {
+        if !avx512_decode_available() {
+            return;
+        }
+        for k in [0, 1, 15, 16, 30, 31] {
+            let values: [u16; 32] =
+                core::array::from_fn(|i| if i == k { 100 } else { 300 + 999 * i as u16 });
+            for next in ["A", "\u{10000}", "\u{180}"] {
+                let count = || crate::simd::AVX512_ONE_SHORT.with(|n| n.get());
+                let before = count();
+                let (result, out) = one_window(&values, next);
+                assert_eq!(count(), before + 1, "{k} {next:?}");
+                assert_eq!(result, (95, 60), "{k} {next:?}");
+                assert_eq!(out, pack_z15(&values), "{k} {next:?}");
+            }
+            // Whole inputs through the dispatch (at least 4096 bytes), the
+            // window after 43 windows of 3-byte characters: results and
+            // errors as in scalar code.
+            let mut all: Vec<u16> = (0..43 * 32).map(|i| 300 + (i % 30000) as u16).collect();
+            all.extend_from_slice(&values);
+            let head = encode_impl::<LEVEL_SCALAR>(&pack_z15(&all));
+            assert!(head.len() >= 4096);
+            for next in ["A", "\u{10000}", "\u{180}", "\u{3400}\u{180}"] {
+                let _ = decode_every_level(&format!("{head}{next}"));
+            }
+        }
+    }
+
+    /// Windows that alternate between one 2-byte character (95 bytes) and
+    /// none (96 bytes), through the dispatch: the 95-byte path runs.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn decode32_alternating_95_and_96() {
+        if !avx512_decode_available() {
+            return;
+        }
+        let values: Vec<u16> = (0..64 * 32)
+            .map(|i| {
+                let (block, lane) = (i / 32, i % 32);
+                if block % 2 == 0 && lane == block / 2 % 32 {
+                    50
+                } else {
+                    300 + (i * 7 % 30000) as u16
+                }
+            })
+            .collect();
+        let data = pack_z15(&values);
+        let encoded = encode_every_level(&data);
+        assert!(encoded.len() >= 4096);
+        let count = || crate::simd::AVX512_ONE_SHORT.with(|n| n.get());
+        let before = count();
+        assert_eq!(decode_every_level(&encoded).unwrap(), data);
+        assert!(count() - before >= 32, "{}", count() - before);
+    }
+
     /// Inputs of 2-byte characters with an invalid, 7-bit or 3-byte
     /// character in every position: every level agrees, on the 2-byte AVX-512
     /// path too.
