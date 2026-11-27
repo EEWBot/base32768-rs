@@ -1225,17 +1225,50 @@ pub unsafe fn decode16_neon(p: *const u8, d: *mut u8) -> usize {
     // 1110aaaa 10bbbbbb 10cccccc -> hi = aaaabbbb, lo = bbcccccc.
     let lead_ok = vceqq_u8(vandq_u8(b0, dup(0xF0)), dup(0xE0));
     let first = vgetq_lane_u64::<0>(vreinterpretq_u64_u8(lead_ok));
-    if first & vgetq_lane_u64::<1>(vreinterpretq_u64_u8(lead_ok)) != u64::MAX {
-        // Not 16 three-byte leads at fixed positions: exactly one 2-byte
-        // character, or else a misaligned first group (a 2-byte character
-        // among them), rejected before the table lookups.
-        let n = unsafe { decode16_one_short_neon(b0, b1, b2, lead_ok, d) };
-        if n != 0 || first != u64::MAX {
-            return n;
-        }
-    }
-    let hi = vsliq_n_u8::<4>(vshrq_n_u8::<2>(b1), b0);
-    let lo = vsliq_n_u8::<6>(b2, b1);
+    // The inputs of the lookup below: the `ld3` registers, the lanes that
+    // must be valid, the high-byte correction and the bytes taken. With
+    // exactly one 2-byte character k, the leads are 3-byte leads before k
+    // and none from k on (every later character starts one byte early):
+    // character k becomes (0xE0, lead, continuation) and character i > k
+    // (c[i - 1], a[i], b[i]) of the registers a, b, c.
+    let (c0, c1, c2, bias, valid, taken) =
+        if first & vgetq_lane_u64::<1>(vreinterpretq_u64_u8(lead_ok)) == u64::MAX {
+            (b0, b1, b2, dup(0x1C), lead_ok, 48)
+        } else {
+            // Lane masks: k (`short`), after k (`after`), k and after
+            // (`shifted`).
+            let prev = vextq_u8::<15>(dup(0xFF), lead_ok);
+            let short = vbicq_u8(prev, lead_ok);
+            let after = vmvnq_u8(prev);
+            let shifted = vmvnq_u8(lead_ok);
+            let prev_c = vextq_u8::<15>(dup(0), b2);
+            // A 3-byte lead after a lane without one (not a single run),
+            // character k not a 2-byte lead, or a later character not a
+            // 3-byte lead.
+            let two_lead = vceqq_u8(vandq_u8(b0, dup(0xE0)), dup(0xC0));
+            let three_lead = vceqq_u8(vandq_u8(prev_c, dup(0xF0)), dup(0xE0));
+            let bad_width = vorrq_u8(
+                vbicq_u8(lead_ok, prev),
+                vorrq_u8(vbicq_u8(short, two_lead), vbicq_u8(after, three_lead)),
+            );
+            if vmaxvq_u8(bad_width) == 0 {
+                (
+                    vbslq_u8(short, dup(0xE0), vbslq_u8(after, prev_c, b0)),
+                    vbslq_u8(shifted, b0, b1),
+                    vbslq_u8(shifted, b1, b2),
+                    vbslq_u8(short, dup(0xFC), dup(0x1C)),
+                    dup(0xFF),
+                    47,
+                )
+            } else if first != u64::MAX {
+                // A misaligned first group: rejected before the lookups.
+                return 0;
+            } else {
+                (b0, b1, b2, dup(0x1C), lead_ok, 48)
+            }
+        };
+    let hi = vsliq_n_u8::<4>(vshrq_n_u8::<2>(c1), c0);
+    let lo = vsliq_n_u8::<6>(c2, c1);
 
     // SAFETY: each `vld1q_u8_x4` reads 64 bytes of a table at least that long.
     let (start_t, missing_t, end_t) = unsafe {
@@ -1245,21 +1278,22 @@ pub unsafe fn decode16_neon(p: *const u8, d: *mut u8) -> usize {
             vld1q_u8_x4(END.as_ptr()),
         )
     };
-    // The page's entry: its group's biased start plus the page (mod 256).
     let page = vaddq_u8(vqtbl4q_u8(start_t, vshrq_n_u8::<2>(hi)), hi);
     let missing = vqtbl4q_u8(missing_t, page);
-    // Missing blocks from this one through the end of the page; bit zero
-    // marks a character outside the repertoire.
     let suffix = vshlq_u8(missing, vnegq_s8(vreinterpretq_s8_u8(vshrq_n_u8::<5>(lo))));
-    let bad = vreinterpretq_u64_u8(vornq_u8(vandq_u8(suffix, dup(1)), lead_ok));
+    let bad = vreinterpretq_u64_u8(vornq_u8(vandq_u8(suffix, dup(1)), valid));
     if vgetq_lane_u64::<0>(bad) != 0 {
         return 0;
     }
     let groups = if vgetq_lane_u64::<1>(bad) == 0 { 2 } else { 1 };
+    if groups == 1 && taken == 47 {
+        return 0;
+    }
 
-    // D - 224 as an i8, then z = cp - 0x1C00 - 32 * (D - 224).
+    // z = cp - 32 * delta - 0x1C00, or + 0x400 for a 2-byte character: the
+    // correction is subtracted from the high byte (0xFC = -4; see build.rs).
     let delta = vreinterpretq_s8_u8(vsubq_u8(vqtbl4q_u8(end_t, page), vcntq_u8(suffix)));
-    let hi_adj = vsubq_u8(hi, dup(0x1C));
+    let hi_adj = vsubq_u8(hi, bias);
     let cp0 = vreinterpretq_u16_u8(vzip1q_u8(lo, hi_adj));
     let cp1 = vreinterpretq_u16_u8(vzip2q_u8(lo, hi_adj));
     let z0 = vsubq_u16(
@@ -1277,93 +1311,10 @@ pub unsafe fn decode16_neon(p: *const u8, d: *mut u8) -> usize {
     }
     #[cfg(test)]
     if groups == 2 {
-        NEON_DECODE_WINDOWS.with(|n| n[0].set(n[0].get() + 1));
+        let k = if taken == 47 { 2 } else { 0 };
+        NEON_DECODE_WINDOWS.with(|n| n[k].set(n[k].get() + 1));
     }
-    24 * groups
-}
-
-/// `decode16_neon` for 16 characters of which exactly one, k, is a 2-byte
-/// character, from the `ld3` registers a, b, c and the 3-byte lead mask:
-/// the leads are 3-byte leads before k and none from k on (every later
-/// character starts one byte early). Character k becomes (0xE0, lead,
-/// continuation) and character i > k (c[i - 1], a[i], b[i]); the code
-/// point of character k is corrected by +0x400 instead of -0x1C00 (see
-/// build.rs). Returns 47, or 0 if the widths or a character do not fit.
-#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
-// NEON is part of the aarch64 baseline; `inline(always)` cannot be
-// combined with `target_feature`.
-#[inline(always)]
-unsafe fn decode16_one_short_neon(
-    a: core::arch::aarch64::uint8x16_t,
-    b: core::arch::aarch64::uint8x16_t,
-    c: core::arch::aarch64::uint8x16_t,
-    lead_ok: core::arch::aarch64::uint8x16_t,
-    d: *mut u8,
-) -> usize {
-    // SAFETY: NEON is part of the aarch64 baseline; the caller guarantees
-    // 32 writable bytes at `d`, and the tables are read within their
-    // lengths.
-    unsafe {
-        use crate::table;
-        use core::arch::aarch64::*;
-        static START: [u8; 64] = table::NEON_PAGE_START;
-        static MISSING: [u8; 64] = table::NEON_PAGE_MISSING;
-        static END: [u8; 64] = table::NEON_PAGE_END;
-        let dup = vdupq_n_u8;
-
-        // Lane masks: k (`short`), after k (`after`), k and after (`shifted`).
-        let prev = vextq_u8::<15>(dup(0xFF), lead_ok);
-        let short = vbicq_u8(prev, lead_ok);
-        let after = vmvnq_u8(prev);
-        let shifted = vmvnq_u8(lead_ok);
-        let prev_c = vextq_u8::<15>(dup(0), c);
-        // A 3-byte lead after a lane without one (not a single run), character
-        // k not a 2-byte lead, or a later character not a 3-byte lead.
-        let two_lead = vceqq_u8(vandq_u8(a, dup(0xE0)), dup(0xC0));
-        let three_lead = vceqq_u8(vandq_u8(prev_c, dup(0xF0)), dup(0xE0));
-        let bad_width = vorrq_u8(
-            vbicq_u8(lead_ok, prev),
-            vorrq_u8(vbicq_u8(short, two_lead), vbicq_u8(after, three_lead)),
-        );
-        if vmaxvq_u8(bad_width) != 0 {
-            return 0;
-        }
-        let b0 = vbslq_u8(short, dup(0xE0), vbslq_u8(after, prev_c, a));
-        let b1 = vbslq_u8(shifted, a, b);
-        let b2 = vbslq_u8(shifted, b, c);
-        let hi = vsliq_n_u8::<4>(vshrq_n_u8::<2>(b1), b0);
-        let lo = vsliq_n_u8::<6>(b2, b1);
-
-        // Each `vld1q_u8_x4` reads 64 bytes of a table at least that long.
-        let (start_t, missing_t, end_t) = (
-            vld1q_u8_x4(START.as_ptr()),
-            vld1q_u8_x4(MISSING.as_ptr()),
-            vld1q_u8_x4(END.as_ptr()),
-        );
-        let page = vaddq_u8(vqtbl4q_u8(start_t, vshrq_n_u8::<2>(hi)), hi);
-        let missing = vqtbl4q_u8(missing_t, page);
-        let suffix = vshlq_u8(missing, vnegq_s8(vreinterpretq_s8_u8(vshrq_n_u8::<5>(lo))));
-        if vmaxvq_u8(vandq_u8(suffix, dup(1))) != 0 {
-            return 0;
-        }
-        let delta = vreinterpretq_s8_u8(vsubq_u8(vqtbl4q_u8(end_t, page), vcntq_u8(suffix)));
-        // z = cp - 32 * delta - 0x1C00, or + 0x400 for character k: the
-        // correction is subtracted from the high byte (0xFC = -4).
-        let hi_adj = vsubq_u8(hi, vbslq_u8(short, dup(0xFC), dup(0x1C)));
-        let cp0 = vreinterpretq_u16_u8(vzip1q_u8(lo, hi_adj));
-        let cp1 = vreinterpretq_u16_u8(vzip2q_u8(lo, hi_adj));
-        let z0 = vsubq_u16(
-            cp0,
-            vreinterpretq_u16_s16(vshll_n_s8::<5>(vget_low_s8(delta))),
-        );
-        let z1 = vsubq_u16(cp1, vreinterpretq_u16_s16(vshll_high_n_s8::<5>(delta)));
-        // The caller guarantees room for 32 bytes.
-        vst1q_u8(d, pack8_neon(z0));
-        vst1q_u8(d.add(15), pack8_neon(z1));
-        #[cfg(test)]
-        NEON_DECODE_WINDOWS.with(|n| n[2].set(n[2].get() + 1));
-        47
-    }
+    if groups == 2 { taken } else { 24 }
 }
 
 /// Decodes up to 16 two-byte 15-bit characters at `p .. p + 32`, as
