@@ -156,6 +156,140 @@ pub unsafe fn decode16_2byte_avx2(p: *const u8, d: *mut u8) -> usize {
     groups
 }
 
+/// Code points of 16 three-byte characters at `p .. p + 48`, or `None` if
+/// any lead byte is not a 3-byte lead (0xE0..=0xEF). As `code_points_8x3`
+/// with one group of 8 per 128-bit lane.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn code_points_16x3_avx2(p: *const u8) -> Option<[u16; 16]> {
+    use core::arch::x86_64::*;
+    // Byte `k` of each character in the low byte of a u16 lane: characters
+    // 0..=4 from `lo` (bytes 0..16 of the group), 5..=7 from `hi` (8..24).
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    fn gather<const K: i8>(lo: __m256i, hi: __m256i) -> __m256i {
+        let from_lo = _mm256_broadcastsi128_si256(_mm_setr_epi8(
+            K,
+            -1,
+            K + 3,
+            -1,
+            K + 6,
+            -1,
+            K + 9,
+            -1,
+            K + 12,
+            -1,
+            -1,
+            -1,
+            -1,
+            -1,
+            -1,
+            -1,
+        ));
+        let from_hi = _mm256_broadcastsi128_si256(_mm_setr_epi8(
+            -1,
+            -1,
+            -1,
+            -1,
+            -1,
+            -1,
+            -1,
+            -1,
+            -1,
+            -1,
+            K + 7,
+            -1,
+            K + 10,
+            -1,
+            K + 13,
+            -1,
+        ));
+        _mm256_or_si256(
+            _mm256_shuffle_epi8(lo, from_lo),
+            _mm256_shuffle_epi8(hi, from_hi),
+        )
+    }
+    // SAFETY: the caller guarantees `p .. p + 48` is readable.
+    let (lo, hi) = unsafe {
+        (
+            _mm256_loadu2_m128i(p.add(24).cast(), p.cast()),
+            _mm256_loadu2_m128i(p.add(32).cast(), p.add(8).cast()),
+        )
+    };
+    let b0 = gather::<0>(lo, hi);
+    let lead = _mm256_and_si256(b0, _mm256_set1_epi16(0xF0));
+    if _mm256_movemask_epi8(_mm256_cmpeq_epi16(lead, _mm256_set1_epi16(0xE0))) != -1 {
+        return None;
+    }
+    let b1 = gather::<1>(lo, hi);
+    let b2 = gather::<2>(lo, hi);
+    let cp = _mm256_or_si256(
+        _mm256_or_si256(
+            _mm256_slli_epi16::<12>(b0),
+            _mm256_slli_epi16::<6>(_mm256_and_si256(b1, _mm256_set1_epi16(0x3F))),
+        ),
+        _mm256_and_si256(b2, _mm256_set1_epi16(0x3F)),
+    );
+    let mut out = [0u16; 16];
+    // SAFETY: `out` is 32 bytes.
+    unsafe { _mm256_storeu_si256(out.as_mut_ptr().cast(), cp) };
+    Some(out)
+}
+
+/// Decodes 16 three-byte 15-bit characters at `p .. p + 48` to `d` as 30
+/// bytes, 15 per group of 8, and returns whether it did; otherwise (a lead
+/// that is not a 3-byte lead, or a 7-bit or invalid character) writes
+/// nothing. 31 bytes are stored. The values come from scalar lookups in
+/// `table::DECODE`; the packing to 15-bit fields is vectorized.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+pub unsafe fn decode16_3byte_avx2(p: *const u8, d: *mut u8) -> bool {
+    use core::arch::x86_64::*;
+    // SAFETY: the caller guarantees `p .. p + 48` is readable.
+    let Some(cps) = (unsafe { code_points_16x3_avx2(p) }) else {
+        return false;
+    };
+    let z = cps.map(|cp| crate::table::DECODE[cp as usize] as i16);
+    // Built with inserts: a 32-byte load of the 16 values just stored
+    // would wait for them (no store forwarding).
+    let z = _mm256_setr_epi16(
+        z[0], z[1], z[2], z[3], z[4], z[5], z[6], z[7], z[8], z[9], z[10], z[11], z[12], z[13],
+        z[14], z[15],
+    );
+    // Bit 15 is set for 7-bit and invalid characters.
+    if _mm256_movemask_epi8(z) as u32 & 0xAAAA_AAAA != 0 {
+        return false;
+    }
+    // u32 lane i: z[2i] << 17 | z[2i + 1] << 2, a left-aligned 30-bit pair
+    // starting at output bit 30i of its group. Word i (output bits 32i..)
+    // is pair i << 2i with the top 2i + 2 bits of pair i + 1.
+    let pairs = _mm256_or_si256(
+        _mm256_slli_epi32::<17>(z),
+        _mm256_slli_epi32::<2>(_mm256_srli_epi32::<16>(z)),
+    );
+    let next = _mm256_bsrli_epi128::<4>(pairs);
+    let words = _mm256_or_si256(
+        _mm256_sllv_epi32(pairs, _mm256_setr_epi32(0, 2, 4, 6, 0, 2, 4, 6)),
+        _mm256_srlv_epi32(next, _mm256_setr_epi32(30, 28, 26, 24, 30, 28, 26, 24)),
+    );
+    let out = _mm256_shuffle_epi8(
+        words,
+        _mm256_broadcastsi128_si256(_mm_setr_epi8(
+            3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12,
+        )),
+    );
+    // SAFETY: the caller guarantees 31 writable bytes at `d`.
+    unsafe {
+        _mm_storeu_si128(d.cast(), _mm256_castsi256_si128(out));
+        _mm_storeu_si128(d.add(15).cast(), _mm256_extracti128_si256::<1>(out));
+    }
+    #[cfg(test)]
+    AVX2_3BYTE_WINDOWS.with(|n| n.set(n.get() + 1));
+    true
+}
+
 /// Encodes the 60 bytes at `src` (61 are read) as 32 characters at `d`
 /// and returns the number of bytes (64..=96). Up to 100 bytes may be
 /// written.
@@ -1083,6 +1217,9 @@ thread_local! {
     /// paths took on this thread.
     pub static AVX2_2BYTE_WINDOWS: [core::cell::Cell<usize>; 2] =
         const { [core::cell::Cell::new(0), core::cell::Cell::new(0)] };
+    /// Number of 16-character windows the AVX2 3-byte decode path took on
+    /// this thread.
+    pub static AVX2_3BYTE_WINDOWS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
 }
 
 #[cfg(all(test, target_arch = "x86_64"))]
