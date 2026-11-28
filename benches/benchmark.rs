@@ -15,10 +15,24 @@ fn criterion_benchmark(c: &mut Criterion) {
             (state >> 56) as u8
         })
         .collect();
-    let datasets: [(&str, &[u8]); 4] = [
+    let zeros = vec![0u8; 1_000_000];
+    // Pack a cycle of all 224 two-byte primary values into 15-bit fields.
+    let mut short_values = vec![0u8; 999_990];
+    for (group, chunk) in short_values.as_chunks_mut::<15>().0.iter_mut().enumerate() {
+        for lane in 0..8 {
+            let z = ((8 * group + lane) * 79 % 224) as u8;
+            chunk[2 * lane] = z >> (7 - lane);
+            if lane < 7 {
+                chunk[2 * lane + 1] = z << (1 + lane);
+            }
+        }
+    }
+    let datasets: [(&str, &[u8]); 6] = [
         ("OneByte", &one_byte_array),
         ("TenKilobytes", &ten_kilobytes_array),
         ("OneMegabyte", &one_megabytes_array),
+        ("ZeroMegabyte", &zeros),
+        ("ShortMegabyte", &short_values),
         ("RandomOneMegabyte", &random_one_megabyte_array),
     ];
 

@@ -37,7 +37,10 @@ unsafe fn put(dst: *mut u8, pos: usize, packed: u32) -> usize {
 
 /// At least 24 of the 32 15-bit values in the 60 bytes are below 224
 /// (2-byte characters).
-#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+#[cfg(any(
+    target_arch = "x86_64",
+    all(target_arch = "aarch64", target_endian = "little")
+))]
 #[inline]
 fn two_byte_dense_values(head: &[u8]) -> bool {
     let (chunks, _) = head.as_chunks::<15>();
@@ -68,7 +71,6 @@ fn two_byte_dense_values(head: &[u8]) -> bool {
 ///
 /// # Safety
 /// `dst + pos .. dst + pos + 25` must be writable.
-#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
 #[inline(always)]
 unsafe fn encode_chunk(chunk: &[u8; 15], dst: *mut u8, mut pos: usize) -> usize {
     let hi = u64::from_be_bytes(chunk[0..8].try_into().unwrap());
@@ -206,8 +208,9 @@ fn encode_append<const LEVEL: u8>(b: &[u8], out: &mut Vec<u8>) {
         (done, pos) = unsafe { encode_avx512(b, dst) };
     }
 
-    // AVX2: 60 bytes -> 32 characters. After the AVX-512 path fewer than 60
-    // bytes remain, so this runs only on CPUs without it.
+    // AVX2: 60 bytes -> 32 characters, or for inputs of mostly 2-byte
+    // characters 30 bytes -> 16. After the AVX-512 path fewer than 60 bytes
+    // remain, so this runs only on CPUs without it.
     #[cfg(target_arch = "x86_64")]
     if LEVEL >= LEVEL_SIMD && b.len() - done >= 61 && std::is_x86_feature_detected!("avx2") {
         #[target_feature(enable = "avx2")]
@@ -227,8 +230,45 @@ fn encode_append<const LEVEL: u8>(b: &[u8], out: &mut Vec<u8>) {
             }
             (done, pos)
         }
+        /// Inputs of mostly 2-byte characters (runs of zero bytes): 30 bytes
+        /// -> 16 characters per window. A window with 3-byte characters
+        /// takes the scalar code, 15 bytes at a time, as on NEON; the 60-byte
+        /// block would need a second inlined copy of `encode32_avx2`, and
+        /// with a call `encode_avx2` reloads its tables per block. In its
+        /// own function so that `encode_avx2` compiles as without it.
+        #[target_feature(enable = "avx2")]
+        #[inline(never)]
+        unsafe fn encode_avx2_dense(
+            b: &[u8],
+            dst: *mut u8,
+            mut done: usize,
+            mut pos: usize,
+        ) -> (usize, usize) {
+            while done + 31 <= b.len() {
+                // SAFETY: 31 bytes are readable at `done`, and the 30 bytes
+                // encoded reserve 16 * 3 = 48 output bytes, more than the 32
+                // written.
+                if unsafe { simd::encode16_2byte_avx2(b.as_ptr().add(done), dst.add(pos)) } {
+                    pos += 32;
+                    done += 30;
+                    continue;
+                }
+                for chunk in b[done..done + 30].as_chunks::<15>().0 {
+                    // SAFETY: as in the scalar path.
+                    pos = unsafe { encode_chunk(chunk, dst, pos) };
+                }
+                done += 30;
+            }
+            (done, pos)
+        }
         // SAFETY: AVX2 was just checked.
-        (done, pos) = unsafe { encode_avx2(b, dst, done, pos) };
+        (done, pos) = unsafe {
+            if b.len() - done >= 1024 && two_byte_dense_values(&b[done..done + 60]) {
+                encode_avx2_dense(b, dst, done, pos)
+            } else {
+                encode_avx2(b, dst, done, pos)
+            }
+        };
     }
 
     // NEON: inputs of mostly 2-byte characters (runs of zero bytes), 30
@@ -572,7 +612,8 @@ unsafe fn read_8<const SIMD: bool>(p: *const u8) -> ([u32; 8], usize) {
 /// # Safety
 /// `dst` must have room for `decoded_capacity(bytes.len()) - 1` bytes; with `SIMD`, see
 /// [`read_8`]; with `AVX512`, the CPU must support AVX-512 BW, VBMI, VBMI2 and BITALG.
-/// `DENSE` (with `AVX512`) adds a path for windows of 2-byte characters; see
+/// `DENSE` (with `AVX512`, or with `SIMD`: on x86-64 the CPU must then support
+/// AVX2) adds a path for windows of 2-byte characters; see
 /// [`decode_fast_dispatch`] for why it is a separate instance.
 #[inline(always)]
 unsafe fn decode_fast<const SIMD: bool, const AVX512: bool, const DENSE: bool>(
@@ -620,6 +661,34 @@ unsafe fn decode_fast<const SIMD: bool, const AVX512: bool, const DENSE: bool>(
             // `groups <= 3`.
             pos += 24 * groups;
             written += 15 * groups;
+        }
+        #[cfg(target_arch = "x86_64")]
+        if DENSE && !AVX512 && pos + 34 <= len && unsafe { *src.add(pos) } < 0xE0 {
+            // AVX2: windows of 16 two-byte characters after a 2-byte (or
+            // invalid) lead, in a loop of their own (constants stay in
+            // registers); the 8-character path below takes a rejected group.
+            loop {
+                // SAFETY: `pos + 34 <= len`. Each group consumes 16 input
+                // bytes, which account for its 15 bytes of `dst` capacity;
+                // the 16th byte stored is within the capacity of the
+                // character after them (2 more bytes at least).
+                let groups = unsafe { simd::decode16_2byte_avx2(src.add(pos), dst.add(written)) };
+                // A whole window keeps the next position independent of the
+                // vector computation.
+                if groups != 2 {
+                    pos += 16 * groups;
+                    written += 15 * groups;
+                    break;
+                }
+                pos += 32;
+                written += 30;
+                if pos + 34 > len {
+                    break;
+                }
+            }
+            if pos + 24 > len {
+                break;
+            }
         }
         #[cfg(target_arch = "x86_64")]
         if AVX512 && !DENSE && pos + 64 <= len {
@@ -694,7 +763,10 @@ unsafe fn decode_fast<const SIMD: bool, const AVX512: bool, const DENSE: bool>(
 /// # Safety
 /// At least 24 of the 64 bytes are 2-byte UTF-8 leads (runs of zero bytes
 /// in the input data).
-#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+#[cfg(any(
+    target_arch = "x86_64",
+    all(target_arch = "aarch64", target_endian = "little")
+))]
 #[inline]
 fn two_byte_dense(head: &[u8]) -> bool {
     head.iter().filter(|&&b| b & 0xE0 == 0xC0).count() >= 24
@@ -772,8 +844,25 @@ unsafe fn decode_fast_dispatch<const LEVEL: u8>(
         unsafe fn decode_fast_ssse3(bytes: &[u8], dst: *mut u8) -> (usize, usize, usize) {
             unsafe { decode_fast::<true, false, false>(bytes, dst) }
         }
-        // SAFETY: SSSE3 support was just checked.
-        return unsafe { decode_fast_ssse3(bytes, dst) };
+        // Inputs of mostly 2-byte characters: an instance with the AVX2
+        // 2-byte path, separate as for AVX-512 and NEON.
+        #[target_feature(enable = "avx2")]
+        #[inline(never)]
+        unsafe fn decode_fast_avx2_dense(bytes: &[u8], dst: *mut u8) -> (usize, usize, usize) {
+            unsafe { decode_fast::<true, false, true>(bytes, dst) }
+        }
+        // SAFETY: SSSE3 support was just checked, and AVX2 (which implies
+        // it) for the dense instance.
+        return unsafe {
+            if bytes.len() >= 1024
+                && two_byte_dense(&bytes[..64])
+                && std::is_x86_feature_detected!("avx2")
+            {
+                decode_fast_avx2_dense(bytes, dst)
+            } else {
+                decode_fast_ssse3(bytes, dst)
+            }
+        };
     }
 
     #[cfg(all(target_arch = "aarch64", target_endian = "little"))]

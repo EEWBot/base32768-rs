@@ -1,5 +1,26 @@
 //! SIMD kernels of the fast paths.
 
+/// The bits of a 15-byte half that hold the top 7 bits of a value. Byte
+/// 15 of the first load is byte 0 of the second, checked there.
+#[cfg(any(
+    target_arch = "x86_64",
+    all(target_arch = "aarch64", target_endian = "little")
+))]
+const fn short_mask() -> [u8; 16] {
+    let mut m = [0u8; 16];
+    let mut i = 0;
+    while i < 8 {
+        let mut k = 0;
+        while k < 7 {
+            let bit = 15 * i + k;
+            m[bit / 8] |= 0x80 >> (bit % 8);
+            k += 1;
+        }
+        i += 1;
+    }
+    m
+}
+
 /// `vpmulhuw`. Through `asm!` because LLVM otherwise widens the lanes to
 /// per-dword variable shifts when it recognizes the constant powers of two.
 #[cfg(target_arch = "x86_64")]
@@ -15,6 +36,118 @@ fn mulhi_avx2(
         core::arch::asm!("vpmulhuw {r}, {x}, {f}", r = lateout(ymm_reg) result, x = in(ymm_reg) x, f = in(ymm_reg) factors, options(pure, nomem, nostack, preserves_flags));
     }
     result
+}
+
+/// Encodes the 30 bytes at `src` (31 are read) as 16 characters at `d` (32
+/// bytes) if all of them are 2-byte characters (values below 224), and
+/// returns whether it did; otherwise writes nothing.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+pub unsafe fn encode16_2byte_avx2(src: *const u8, d: *mut u8) -> bool {
+    use core::arch::x86_64::*;
+    static SHORT: [u8; 16] = short_mask();
+    static PREFIX: [u16; 8] = crate::table::ENCODE_2BYTE_PREFIX;
+    // SAFETY: the caller guarantees 31 readable bytes at `src` and 32
+    // writable bytes at `d`; both tables are 16 bytes.
+    unsafe {
+        let mask = _mm256_broadcastsi128_si256(_mm_loadu_si128(SHORT.as_ptr().cast()));
+        let prefix = _mm256_broadcastsi128_si256(_mm_loadu_si128(PREFIX.as_ptr().cast()));
+        let swap = _mm256_broadcastsi128_si256(_mm_setr_epi8(
+            1, 0, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10, 13, 12, 15, 14,
+        ));
+        let factors = _mm256_broadcastsi128_si256(_mm_setr_epi16(
+            i16::MIN,
+            16384,
+            8192,
+            4096,
+            2048,
+            1024,
+            512,
+            256,
+        ));
+        let v = _mm256_loadu2_m128i(src.add(15).cast(), src.cast());
+        let z = _mm256_and_si256(
+            mulhi_avx2(_mm256_shuffle_epi8(v, swap), factors),
+            _mm256_set1_epi16(255),
+        );
+        let too_large = _mm256_cmpgt_epi16(z, _mm256_set1_epi16(223));
+        let bad = _mm256_or_si256(_mm256_and_si256(v, mask), too_large);
+        if _mm256_testz_si256(bad, bad) == 0 {
+            return false;
+        }
+        let pair = _mm256_mullo_epi16(_mm256_srli_epi16::<5>(z), _mm256_set1_epi16(0x0202));
+        let template = _mm256_shuffle_epi8(prefix, _mm256_or_si256(pair, _mm256_set1_epi16(0x100)));
+        let low = _mm256_slli_epi16::<8>(_mm256_and_si256(z, _mm256_set1_epi16(31)));
+        _mm256_storeu_si256(d.cast(), _mm256_or_si256(template, low));
+    }
+    true
+}
+
+/// Decodes up to 16 two-byte 15-bit characters (leads D0..DF) at
+/// `p .. p + 32`, a character boundary of valid UTF-8. Returns how many
+/// leading 8-character groups (0..=2) hold only such characters; those
+/// groups are written to `d` as 15 bytes each (16 bytes are stored per
+/// group).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+pub unsafe fn decode16_2byte_avx2(p: *const u8, d: *mut u8) -> usize {
+    use core::arch::x86_64::*;
+    static BASE: [u8; 64] = crate::table::DECODE_2BYTE_BLOCK;
+    // SAFETY: the caller guarantees 32 readable bytes at `p`; each table
+    // load reads 16 of BASE's 64 bytes.
+    let (v, lower, upper) = unsafe {
+        let table = |i| _mm256_broadcastsi128_si256(_mm_loadu_si128(BASE.as_ptr().add(i).cast()));
+        (_mm256_loadu_si256(p.cast()), table(32), table(48))
+    };
+    // Each u16 lane holds a lead (low byte) and its continuation. The
+    // primary 2-byte characters are in blocks 32..=63 of 32 code points:
+    // block % 16 = 2 * (lead & 7) + bit 5 of the continuation, and bit 3 of
+    // the lead selects one of two pshufb tables. Bit 15 of the index clears
+    // the high byte.
+    let byte = _mm256_srli_epi16::<8>(v);
+    let bit = _mm256_and_si256(_mm256_srli_epi16::<5>(byte), _mm256_set1_epi16(1));
+    let block = _mm256_or_si256(_mm256_slli_epi16::<1>(v), bit);
+    let index = _mm256_or_si256(
+        _mm256_and_si256(block, _mm256_set1_epi16(15)),
+        _mm256_set1_epi16(i16::MIN),
+    );
+    let base = _mm256_blendv_epi8(
+        _mm256_shuffle_epi8(lower, index),
+        _mm256_shuffle_epi8(upper, index),
+        _mm256_slli_epi16::<4>(v),
+    );
+    let lead_ok = _mm256_cmpeq_epi16(
+        _mm256_and_si256(v, _mm256_set1_epi16(0xF0)),
+        _mm256_set1_epi16(0xD0),
+    );
+    let block_bad = _mm256_cmpeq_epi16(base, _mm256_set1_epi16(255));
+    let ok = _mm256_movemask_epi8(_mm256_andnot_si256(block_bad, lead_ok)) as u32;
+    let groups = if ok == u32::MAX {
+        2
+    } else if ok & 0xFFFF == 0xFFFF {
+        1
+    } else {
+        return 0;
+    };
+    // z < 224 fits in a byte: output bytes 2i and 2i + 1 of a group are
+    // z_i >> (7 - i) and z_i << (1 + i), the high and low bytes of
+    // z_i << (1 + i); for i = 7, byte 14 is z_i and byte 15 is zero.
+    let z = _mm256_or_si256(base, _mm256_and_si256(byte, _mm256_set1_epi16(31)));
+    let factors = _mm256_broadcastsi128_si256(_mm_setr_epi16(2, 4, 8, 16, 32, 64, 128, 1));
+    let swap = _mm256_broadcastsi128_si256(_mm_setr_epi8(
+        1, 0, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10, 13, 12, 14, -1,
+    ));
+    let out = _mm256_shuffle_epi8(_mm256_mullo_epi16(z, factors), swap);
+    // SAFETY: the caller guarantees room for 16 bytes per group.
+    unsafe {
+        _mm_storeu_si128(d.cast(), _mm256_castsi256_si128(out));
+        if groups == 2 {
+            _mm_storeu_si128(d.add(15).cast(), _mm256_extracti128_si256::<1>(out));
+        }
+    }
+    groups
 }
 
 /// Encodes the 60 bytes at `src` (61 are read) as 32 characters at `d`
@@ -1129,22 +1262,6 @@ pub unsafe fn code_points_8x3(p: *const u8) -> Option<[u16; 8]> {
 pub unsafe fn encode16_2byte_short_neon(src: *const u8, d: *mut u8) -> bool {
     use crate::table;
     use core::arch::aarch64::*;
-    /// The bits of a 15-byte half that hold the top 7 bits of a value. Byte
-    /// 15 of the first load is byte 0 of the second, checked there.
-    const fn short_mask() -> [u8; 16] {
-        let mut m = [0u8; 16];
-        let mut i = 0;
-        while i < 8 {
-            let mut k = 0;
-            while k < 7 {
-                let bit = 15 * i + k;
-                m[bit / 8] |= 0x80 >> (bit % 8);
-                k += 1;
-            }
-            i += 1;
-        }
-        m
-    }
     static SHORT: [u8; 16] = short_mask();
     static LEFT: [i8; 16] = [7, 6, 5, 4, 3, 2, 1, 0, 7, 6, 5, 4, 3, 2, 1, 0];
     static RIGHT: [i8; 16] = [
