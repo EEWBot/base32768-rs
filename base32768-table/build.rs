@@ -137,41 +137,27 @@ fn main() {
         decode[cp as usize] = 0x8000 | z as u16;
     }
 
-    // AVX2 encode: cp = z + 32 * D(z), where D(z) = low + (z >= 0xD40) * 256.
-    // For z < 0xDC0 or z >= 0x7DE0, low is byte z >> 5 & 127 of this table
-    // (8 tables of 16 for vpshufb). Both ranges fit because they share no
-    // index: 0..=109 for z < 0xDC0, 111..=127 for z >= 0x7DE0. Elsewhere low
-    // is 50, 51 or 53.
+    // AVX2 encode: cp = z + 32 * (low + steps), where steps = 256 * (z >=
+    // 0xD40) + (z >= 0x2760) + 2 * (z >= 0x7960) and low depends only on the
+    // block z >> 5, read from a 128-byte table (8 tables of 16 for vpshufb):
+    // blocks 0..=109 keep their index, blocks 110..=1006 (z = 0xDC0 ..
+    // 0x7DE0), whose low is the same, share slot 110, and the last 17 blocks
+    // take slots 111..=127. The kernel's index is
+    // max(min(z, 0xDC0), z - 0x7000 (saturating)) >> 5.
     let z15_cps = chars(&z15_blocks);
     let d_of = |z: u32| -> u32 { (z15_cps[z as usize] >> BLOCK_BITS) - (z >> BLOCK_BITS) };
     let high = |z: u32| -> u32 { if z >= 0xD40 { 256 } else { 0 } };
-    let mut encode_avx2 = vec![0u8; 128];
-    for t in 0..4u32 {
-        for i in 0..32u32 {
-            let z = match t {
-                0..=2 => t << 10 | i << 5,
-                _ if i < 14 => 0xC00 | i << 5,
-                _ if i >= 15 => 0x7C00 | i << 5,
-                _ => continue,
-            };
-            encode_avx2[(t * 32 + i) as usize] = u8::try_from(d_of(z) - high(z)).unwrap();
-        }
-    }
+    let steps = |z: u32| high(z) + u32::from(z >= 0x2760) + 2 * u32::from(z >= 0x7960);
+    let mut encode_avx2 = [None; 128];
     for z in 0..0x8000u32 {
-        let low = if !(0xDC0..0x7DE0).contains(&z) {
-            encode_avx2[((z >> 10).min(3) * 32 + (z >> 5 & 31)) as usize] as u32
-        } else {
-            50 + (z >= 0x2760) as u32 + 2 * (z >= 0x7960) as u32
-        };
-        assert_eq!(
-            z + ((low + high(z)) << BLOCK_BITS),
-            z15_cps[z as usize],
-            "z {z:#x}"
-        );
+        let slot = (z.min(0xDC0).max(z.saturating_sub(0x7000)) >> BLOCK_BITS) as usize;
+        let low = u8::try_from(d_of(z) - steps(z)).unwrap();
+        assert_eq!(*encode_avx2[slot].get_or_insert(low), low, "z {z:#x}");
     }
+    let encode_avx2 = encode_avx2.map(Option::unwrap);
 
     // AVX-512 encode: cp = z + 0x2000 * (z >= 0xD40) + 32 * low, where low
-    // (as in the AVX2 table) depends only on the block z >> 5. The 8 lows of
+    // depends only on the block z >> 5. The 8 lows of
     // each 1024 / 8 = 128 units of 8 blocks (u = z >> 8) form 22 distinct
     // patterns, overlapped into one string of at most 128 bytes. A unit's
     // start in it is stored biased by -8u (mod 128), so that adding the
@@ -417,12 +403,11 @@ fn main() {
 
     write_array(
         &mut out,
-        "/// AVX2 encode offsets (see build.rs).",
+        "/// AVX2 encode offsets, by folded block (see build.rs).",
         "ENCODE_AVX2",
         "u8",
         &encode_avx2,
     );
-
     write_array(
         &mut out,
         "/// AVX-512 encode: per 8-block unit, start in `ENCODE_OFFSET_IDS` - 8 * unit (mod 128).",

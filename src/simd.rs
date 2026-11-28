@@ -1,5 +1,22 @@
 //! SIMD kernels of the fast paths.
 
+/// `vpmulhuw`. Through `asm!` because LLVM otherwise widens the lanes to
+/// per-dword variable shifts when it recognizes the constant powers of two.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+fn mulhi_avx2(
+    x: core::arch::x86_64::__m256i,
+    factors: core::arch::x86_64::__m256i,
+) -> core::arch::x86_64::__m256i {
+    let result;
+    // SAFETY: a register-only AVX2 instruction, and AVX2 is enabled.
+    unsafe {
+        core::arch::asm!("vpmulhuw {r}, {x}, {f}", r = lateout(ymm_reg) result, x = in(ymm_reg) x, f = in(ymm_reg) factors, options(pure, nomem, nostack, preserves_flags));
+    }
+    result
+}
+
 /// Encodes the 60 bytes at `src` (61 are read) as 32 characters at `d`
 /// and returns the number of bytes (64..=96). Up to 100 bytes may be
 /// written.
@@ -71,21 +88,21 @@ pub unsafe fn encode32_avx2(src: *const u8, d: *mut u8) -> usize {
     static OUT_A1: [u8; 32] = utf8(false, 16);
     static OUT_B1: [u8; 32] = utf8(true, 16);
     static LOW: [u8; 128] = table::ENCODE_AVX2;
-    /// Per 4 characters in u32 lanes: keep bytes 0, 1 and, unless the
-    /// character is 2 bytes (mask bit set), byte 2.
+    /// Per 4 characters in u32 lanes: skip byte 0 for two-byte characters
+    /// (mask bit set) and always keep bytes 1 and 2.
     const fn compress() -> [[u8; 16]; 16] {
         let mut t = [[0x80u8; 16]; 16];
         let mut m = 0;
         while m < 16 {
             let (mut o, mut k) = (0, 0);
             while k < 4 {
-                t[m][o] = (4 * k) as u8;
-                t[m][o + 1] = (4 * k + 1) as u8;
-                o += 2;
                 if m >> k & 1 == 0 {
-                    t[m][o] = (4 * k + 2) as u8;
+                    t[m][o] = (4 * k) as u8;
                     o += 1;
                 }
+                t[m][o] = (4 * k + 1) as u8;
+                t[m][o + 1] = (4 * k + 2) as u8;
+                o += 2;
                 k += 1;
             }
             m += 1;
@@ -111,8 +128,7 @@ pub unsafe fn encode32_avx2(src: *const u8, d: *mut u8) -> usize {
             let x = _mm256_shuffle_epi8(v, ld(UNPACK_X.as_ptr()));
             let y = _mm256_shuffle_epi8(v, ld(UNPACK_Y.as_ptr()));
             // LLVM widens the mulhi intrinsic to 32 bits (vpmovzxwd, packs, vpermq).
-            let lo: __m256i;
-            core::arch::asm!("vpmulhuw {r}, {y}, {f}", r = lateout(ymm_reg) lo, y = in(ymm_reg) y, f = in(ymm_reg) f, options(pure, nomem, nostack, preserves_flags));
+            let lo = mulhi_avx2(y, f);
             // Opaque so that LLVM keeps the signed compares as single vpcmpgtw.
             opaque(_mm256_srli_epi16::<1>(_mm256_or_si256(
                 _mm256_mullo_epi16(x, f),
@@ -125,9 +141,15 @@ pub unsafe fn encode32_avx2(src: *const u8, d: *mut u8) -> usize {
         // z = (x << r | y >> (8 - r)) >> 1 with r = 15 l mod 8: the
         // multiplies by 2^r stand in for per-lane shifts.
 
-        // Shared table lookup for all 32 characters: block index bits
-        // 0..=6 packed to bytes (in-lane: low half A, high half B).
-        let idx = |z: __m256i| _mm256_and_si256(_mm256_srli_epi16::<5>(z), k(127));
+        // Blocks below 110 keep their index, the long middle ranges share
+        // slot 110, and the final 17 blocks occupy slots 111..127.
+        let idx = |z| {
+            let folded = _mm256_max_epu16(
+                _mm256_min_epu16(z, k(0xdc0)),
+                _mm256_subs_epu16(z, k(0x7000)),
+            );
+            _mm256_srli_epi16::<5>(folded)
+        };
         let indices = _mm256_packus_epi16(idx(za), idx(zb));
         let lo4 = _mm256_and_si256(indices, _mm256_set1_epi8(0x0F));
         let t = |n: usize| {
@@ -150,16 +172,14 @@ pub unsafe fn encode32_avx2(src: *const u8, d: *mut u8) -> usize {
 
         let code_points = |z: __m256i, lut8: __m256i| {
             let gt = |c: u16| _mm256_cmpgt_epi16(z, k(c));
-            let lut = _mm256_add_epi16(lut8, _mm256_and_si256(gt(0xD3F), k(256)));
-            // Outside the tables: 306, 307 or 309.
-            let m2 = gt(0x795F);
-            let default = _mm256_sub_epi16(
-                _mm256_sub_epi16(_mm256_sub_epi16(k(306), gt(0x275F)), m2),
-                m2,
-            );
-            let use_lut = _mm256_or_si256(_mm256_cmpgt_epi16(k(0xDC0), z), gt(0x7DDF));
-            let off = _mm256_blendv_epi8(default, lut, use_lut);
-            _mm256_add_epi16(z, _mm256_slli_epi16::<5>(off))
+            let low = _mm256_slli_epi16::<5>(lut8);
+            let high = _mm256_and_si256(gt(0xd3f), k(0x2000));
+            let step1 = _mm256_and_si256(gt(0x275f), k(32));
+            let step2 = _mm256_and_si256(gt(0x795f), k(64));
+            _mm256_add_epi16(
+                _mm256_add_epi16(z, low),
+                _mm256_or_si256(high, _mm256_or_si256(step1, step2)),
+            )
         };
         let cpa = code_points(za, _mm256_unpacklo_epi8(offsets, zero));
         let cpb = code_points(zb, _mm256_unpackhi_epi8(offsets, zero));
@@ -199,20 +219,25 @@ pub unsafe fn encode32_avx2(src: *const u8, d: *mut u8) -> usize {
         core::hint::cold_path();
         let mut pos = 0;
         for (cp, two) in [(cpa, two_a), (cpb, two_b)] {
-            let m = _mm256_movemask_epi8(two) as u32;
+            // Pack the word predicates to one movemask bit per character.
+            let packed = _mm_packs_epi16(
+                _mm256_castsi256_si128(two),
+                _mm256_extracti128_si256::<1>(two),
+            );
+            let bits = _mm_movemask_epi8(packed);
             #[cfg(test)]
             count_avx2_half(
-                match m {
+                match bits {
                     0 => 0,
-                    u32::MAX => 1,
+                    0xffff => 1,
                     _ => 2,
                 },
                 1,
             );
-            if m == 0 {
+            if bits == 0 {
                 store3(cp, d.add(pos));
                 pos += 48;
-            } else if m == u32::MAX {
+            } else if bits == 0xffff {
                 // 16 two-byte characters: UTF-8 fits each u16 lane.
                 let b0 = _mm256_or_si256(_mm256_srli_epi16::<6>(cp), k(0xC0));
                 let b1 = _mm256_or_si256(_mm256_and_si256(cp, k(0x3F)), k(0x80));
@@ -229,19 +254,11 @@ pub unsafe fn encode32_avx2(src: *const u8, d: *mut u8) -> usize {
                     _mm256_and_si256(_mm256_slli_epi16::<2>(cp), k(0x3F00)),
                 );
                 let low6 = _mm256_or_si256(_mm256_and_si256(cp, k(0x3F)), k(0x80));
-                let a2 = _mm256_or_si256(
-                    _mm256_or_si256(_mm256_srli_epi16::<6>(cp), k(0xC0)),
-                    _mm256_slli_epi16::<8>(low6),
-                );
-                let a = _mm256_blendv_epi8(a3, a2, two);
+                // For a short character drop the lead and set bit 6 of
+                // the middle byte, making it a two-byte UTF-8 lead.
+                let a = _mm256_or_si256(a3, _mm256_and_si256(two, k(0x4000)));
                 let c0 = _mm256_unpacklo_epi16(a, low6);
                 let c1 = _mm256_unpackhi_epi16(a, low6);
-                // One bit per character.
-                let mut bits = m & 0x5555_5555;
-                bits = (bits | bits >> 1) & 0x3333_3333;
-                bits = (bits | bits >> 2) & 0x0F0F_0F0F;
-                bits = (bits | bits >> 4) & 0x00FF_00FF;
-                bits = (bits | bits >> 8) & 0xFFFF;
                 let quarters = [
                     _mm256_castsi256_si128(c0),
                     _mm256_castsi256_si128(c1),
