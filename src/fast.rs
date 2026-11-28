@@ -1677,6 +1677,94 @@ mod tests {
         assert_eq!(encoded, encode_impl::<LEVEL_SCALAR>(&data));
     }
 
+    /// The AVX2 2-byte encode path, window by window: inputs of values below
+    /// 224 with one other value at every lane of a few windows and near the
+    /// end, where the windows after it take the path again, and every length
+    /// near 1 KiB. Shorter inputs do not take it.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx2_2byte_encode_windows() {
+        if !std::is_x86_feature_detected!("avx2") {
+            eprintln!("AVX2 not available; skipped");
+            return;
+        }
+        let windows = || crate::simd::AVX2_2BYTE_WINDOWS.with(|n| n[0].get());
+        // 640 values: 1200 bytes, 40 windows.
+        let short: Vec<u16> = (0..640).map(|i| (i * 53 % 224) as u16).collect();
+        for k in (320..352).chain(608..640) {
+            for bad in [224, 255, 256, 300, 0x7FFF] {
+                let mut values = short.clone();
+                values[k] = bad;
+                let data = pack_z15(&values);
+                let before = windows();
+                let encoded = encode_every_level(&data);
+                assert_eq!(decode_every_level(&encoded).unwrap(), data);
+                // All but the 60-byte block with value k and the last 61
+                // bytes or fewer.
+                assert!(windows() - before >= 35, "{k} {bad}");
+            }
+        }
+        let data = pack_z15(&short);
+        for len in 1000..1100 {
+            let _ = encode_every_level(&data[..len]);
+        }
+        let before = windows();
+        let _ = encode_impl::<LEVEL_SIMD>(&data[..1000]);
+        assert_eq!(windows(), before);
+    }
+
+    /// The AVX2 2-byte decode path, window by window: primary 2-byte
+    /// characters with one other character (outside the repertoire, 7-bit,
+    /// 3-byte, 4-byte or ASCII) at every lane of a few windows and near the
+    /// end, and every length near 1 KiB. After a valid 3-byte character the
+    /// windows take the path again. Shorter inputs do not take it.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx2_2byte_decode_windows() {
+        if !std::is_x86_feature_detected!("avx2") {
+            eprintln!("AVX2 not available; skipped");
+            return;
+        }
+        let windows = || crate::simd::AVX2_2BYTE_WINDOWS.with(|n| n[1].get());
+        let all: Vec<u16> = (0..224).collect();
+        let primary: Vec<char> = encode_impl::<LEVEL_SCALAR>(&pack_z15(&all))
+            .chars()
+            .collect();
+        // 640 characters: 1280 bytes, 40 windows.
+        let base: Vec<char> = (0..640).map(|i| primary[i * 37 % 224]).collect();
+        let others = [
+            '\u{400}',
+            '\u{4BF}',
+            '\u{7FF}',
+            '\u{180}',
+            '\u{29F}',
+            '\u{3400}',
+            'A',
+            '\u{10000}',
+        ];
+        for k in (320..352).chain(624..640) {
+            for other in others {
+                let mut chars = base.clone();
+                chars[k] = other;
+                let s: String = chars.into_iter().collect();
+                let before = windows();
+                let _ = decode_every_level(&s);
+                // The 20 windows before character 320, and with a 3-byte
+                // character all but its window and the last.
+                let least = if other == '\u{3400}' { 38 } else { 20 };
+                assert!(windows() - before >= least, "{k} {other:?}");
+            }
+        }
+        let s: String = base.iter().collect();
+        for chars in 500..560 {
+            let end = s.char_indices().nth(chars).unwrap().0;
+            let _ = decode_every_level(&s[..end]);
+        }
+        let before = windows();
+        let _ = decode_impl::<LEVEL_SIMD>(&s[..1000]);
+        assert_eq!(windows(), before);
+    }
+
     /// Every output path of the AVX2 encode block, in both halves: all
     /// 3-byte, all 2-byte, and mixed with every 4-character pattern of 2-byte
     /// characters in every quarter.

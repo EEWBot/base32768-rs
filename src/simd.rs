@@ -81,6 +81,8 @@ pub unsafe fn encode16_2byte_avx2(src: *const u8, d: *mut u8) -> bool {
         let low = _mm256_slli_epi16::<8>(_mm256_and_si256(z, _mm256_set1_epi16(31)));
         _mm256_storeu_si256(d.cast(), _mm256_or_si256(template, low));
     }
+    #[cfg(test)]
+    AVX2_2BYTE_WINDOWS.with(|n| n[0].set(n[0].get() + 1));
     true
 }
 
@@ -146,6 +148,10 @@ pub unsafe fn decode16_2byte_avx2(p: *const u8, d: *mut u8) -> usize {
         if groups == 2 {
             _mm_storeu_si128(d.add(15).cast(), _mm256_extracti128_si256::<1>(out));
         }
+    }
+    #[cfg(test)]
+    if groups == 2 {
+        AVX2_2BYTE_WINDOWS.with(|n| n[1].set(n[1].get() + 1));
     }
     groups
 }
@@ -1073,6 +1079,10 @@ thread_local! {
     /// Number of 16-character halves the AVX2 encode path stored as all
     /// 3-byte, all 2-byte and mixed characters on this thread.
     pub static AVX2_ENCODE_HALVES: core::cell::Cell<[usize; 3]> = const { core::cell::Cell::new([0; 3]) };
+    /// Number of 16-character windows the AVX2 2-byte encode and decode
+    /// paths took on this thread.
+    pub static AVX2_2BYTE_WINDOWS: [core::cell::Cell<usize>; 2] =
+        const { [core::cell::Cell::new(0), core::cell::Cell::new(0)] };
 }
 
 #[cfg(all(test, target_arch = "x86_64"))]
