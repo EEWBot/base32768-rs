@@ -6,9 +6,13 @@ edition = "2024"
 [workspace]
 members = ["base32768-table"]
 
+[features]
+default = []
+# Builds the crate from safe Rust alone (`forbid(unsafe_code)`), without the
+# SIMD fast paths.
+safe-only = []
+
 [dependencies]
-phf = { version = "0.13", features = ["macros"] }
-itertools = "0.14"
 thiserror = "2"
 base32768-table = { path = "base32768-table" }
 

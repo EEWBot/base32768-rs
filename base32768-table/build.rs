@@ -1,51 +1,505 @@
-use std::collections::HashMap;
+use std::fmt::Write;
 
-use const_gen::*;
+const Z15_CHAR_RANGES: &str = "ҠҿԀԟڀڿݠޟ߀ߟကဟႠႿᄀᅟᆀᆟᇠሿበቿዠዿጠጿᎠᏟᐠᙟᚠᛟកសᠠᡟᣀᣟᦀᦟ᧠᧿ᨠᨿᯀᯟᰀᰟᴀᴟ⇠⇿⋀⋟⍀⏟␀␟─❟➀➿⠀⥿⦠⦿⨠⩟⪀⪿⫠⭟ⰀⰟⲀⳟⴀⴟⵀⵟ⺠⻟㇀㇟㐀䶟䷀龿ꀀꑿ꒠꒿ꔀꗿꙀꙟꚠꛟ꜀ꝟꞀꞟꡀꡟ";
+const Z7_CHAR_RANGES: &str = "ƀƟɀʟ";
 
-const Z15_CHAR_RANGES: &'static str = "ҠҿԀԟڀڿݠޟ߀ߟကဟႠႿᄀᅟᆀᆟᇠሿበቿዠዿጠጿᎠᏟᐠᙟᚠᛟកសᠠᡟᣀᣟᦀᦟ᧠᧿ᨠᨿᯀᯟᰀᰟᴀᴟ⇠⇿⋀⋟⍀⏟␀␟─❟➀➿⠀⥿⦠⦿⨠⩟⪀⪿⫠⭟ⰀⰟⲀⳟⴀⴟⵀⵟ⺠⻟㇀㇟㐀䶟䷀龿ꀀꑿ꒠꒿ꔀꗿꙀꙟꚠꛟ꜀ꝟꞀꞟꡀꡟ";
-const Z7_CHAR_RANGES: &'static str = "ƀƟɀʟ";
+/// Every repertoire range starts and ends on a 32-codepoint boundary, so the
+/// repertoires can be described as a list of 32-character blocks.
+const BLOCK_BITS: u32 = 5;
+const BLOCK_SIZE: u32 = 1 << BLOCK_BITS;
 
-fn ranges_to_encode_repertoire(ranges: &'static str) -> Vec<char> {
-    let ranges: Vec<_> = ranges.chars().collect();
+/// Returns the first code point of each 32-character block, in repertoire order.
+fn ranges_to_blocks(ranges: &str) -> Vec<u32> {
+    let ranges: Vec<u32> = ranges.chars().map(u32::from).collect();
+    assert!(ranges.len().is_multiple_of(2));
 
-    if ranges.len() % 2 != 0 {
-        panic!();
+    let mut blocks = vec![];
+    for &[first, last] in ranges.as_chunks::<2>().0 {
+        assert_eq!(
+            first % BLOCK_SIZE,
+            0,
+            "range start U+{first:04X} not block aligned"
+        );
+        assert_eq!(
+            (last + 1) % BLOCK_SIZE,
+            0,
+            "range end U+{last:04X} not block aligned"
+        );
+        blocks.extend((first..=last).step_by(BLOCK_SIZE as usize));
     }
+    blocks
+}
 
-    let mut repertoire = vec![];
+/// Packs the UTF-8 form of `cp` as little-endian bytes in the low 24 bits and
+/// its byte length in the top 8 bits.
+fn packed_utf8(cp: u32) -> u32 {
+    let mut buf = [0u8; 4];
+    let len = char::from_u32(cp).unwrap().encode_utf8(&mut buf).len();
+    assert!(
+        len == 2 || len == 3,
+        "U+{cp:04X} must be 2 or 3 bytes in UTF-8"
+    );
+    u32::from_le_bytes(buf) | (len as u32) << 24
+}
 
-    ranges.chunks_exact(2).for_each(|pair| {
-        repertoire.extend(pair[0]..=pair[1]);
-    });
+fn write_array<T: std::fmt::LowerHex>(
+    out: &mut String,
+    doc: &str,
+    name: &str,
+    ty: &str,
+    values: &[T],
+) {
+    writeln!(out, "{doc}").unwrap();
+    let item = if values.len() > 4096 {
+        "static"
+    } else {
+        "const"
+    };
+    writeln!(out, "pub {item} {name}: [{ty}; {}] = [", values.len()).unwrap();
+    for chunk in values.chunks(16) {
+        let line: Vec<String> = chunk.iter().map(|v| format!("{v:#x}")).collect();
+        writeln!(out, "    {},", line.join(", ")).unwrap();
+    }
+    writeln!(out, "];").unwrap();
+}
 
-    repertoire
+/// Greedy shortest common superstring of `patterns`: merges the pair with
+/// the longest overlap until one string is left.
+fn superstring<T: PartialEq + Clone>(patterns: &[Vec<T>]) -> Vec<T> {
+    let mut strings: Vec<Vec<T>> = vec![];
+    for p in patterns {
+        if !strings.contains(p) {
+            strings.push(p.clone());
+        }
+    }
+    let overlap = |a: &[T], b: &[T]| -> usize {
+        (0..=a.len().min(b.len()))
+            .rev()
+            .find(|&k| a[a.len() - k..] == b[..k])
+            .unwrap()
+    };
+    while strings.len() > 1 {
+        let mut best = (0, 1, 0);
+        for i in 0..strings.len() {
+            for j in 0..strings.len() {
+                if i != j {
+                    let k = overlap(&strings[i], &strings[j]);
+                    if k >= best.2 {
+                        best = (i, j, k);
+                    }
+                }
+            }
+        }
+        let (i, j, k) = best;
+        let mut merged = strings[i].clone();
+        merged.extend_from_slice(&strings[j][k..]);
+        strings.remove(i.max(j));
+        strings.remove(i.min(j));
+        strings.push(merged);
+    }
+    strings.pop().unwrap()
+}
+
+/// Overlaps the 8-byte patterns of the 128 units into one string of at most
+/// 128 bytes and returns it, padded to 128 bytes, with each unit's start
+/// biased by -8u (mod 128).
+fn overlap_units(unit: &dyn Fn(u32) -> Vec<u8>) -> (Vec<u8>, Vec<u8>) {
+    let patterns: Vec<Vec<u8>> = (0..128).map(unit).collect();
+    let mut string = superstring(&patterns);
+    assert!(string.len() <= 128, "{} bytes", string.len());
+    let mut start = vec![0u8; 128];
+    for u in 0..128u32 {
+        let p = unit(u);
+        let s = string.windows(8).position(|w| w == &p[..]).unwrap() as u32;
+        start[u as usize] = (s.wrapping_sub(8 * u) & 127) as u8;
+    }
+    string.resize(128, 0);
+    (string, start)
 }
 
 fn main() {
-    let mut decode_lookup_table: HashMap<char, (u8, u16)> = HashMap::new();
+    let z15_blocks = ranges_to_blocks(Z15_CHAR_RANGES);
+    let z7_blocks = ranges_to_blocks(Z7_CHAR_RANGES);
+    assert_eq!(z15_blocks.len(), (1 << 15) / BLOCK_SIZE as usize);
+    assert_eq!(z7_blocks.len(), (1 << 7) / BLOCK_SIZE as usize);
 
-    let z15_repertoire = ranges_to_encode_repertoire(Z15_CHAR_RANGES);
+    // Decode table indexed by code point, covering every 2 or 3 byte UTF-8
+    // sequence (U+0000..=U+FFFF) so lookups need no bounds check.
+    // 0xFFFF = not a Base32768 character, 0x8000 | z = 7-bit, z = 15-bit.
+    let chars = |blocks: &[u32]| -> Vec<u32> {
+        blocks.iter().flat_map(|&cp| cp..cp + BLOCK_SIZE).collect()
+    };
+    let mut decode = vec![0xFFFFu16; 0x10000];
+    for (z, cp) in chars(&z15_blocks).into_iter().enumerate() {
+        decode[cp as usize] = z as u16;
+    }
+    for (z, cp) in chars(&z7_blocks).into_iter().enumerate() {
+        decode[cp as usize] = 0x8000 | z as u16;
+    }
 
-    z15_repertoire.iter().enumerate().for_each(|(z, chr)| {
-        decode_lookup_table.insert(*chr, (15, z as u16));
-    });
+    // AVX2 encode: cp = z + 32 * (low + steps), where steps = 256 * (z >=
+    // 0xD40) + (z >= 0x2760) + 2 * (z >= 0x7960) and low depends only on the
+    // block z >> 5, read from a 128-byte table (8 tables of 16 for vpshufb):
+    // blocks 0..=109 keep their index, blocks 110..=1006 (z = 0xDC0 ..
+    // 0x7DE0), whose low is the same, share slot 110, and the last 17 blocks
+    // take slots 111..=127. The kernel's index is
+    // max(min(z, 0xDC0), z - 0x7000 (saturating)) >> 5.
+    let z15_cps = chars(&z15_blocks);
+    let d_of = |z: u32| -> u32 { (z15_cps[z as usize] >> BLOCK_BITS) - (z >> BLOCK_BITS) };
+    let high = |z: u32| -> u32 { if z >= 0xD40 { 256 } else { 0 } };
+    let steps = |z: u32| high(z) + u32::from(z >= 0x2760) + 2 * u32::from(z >= 0x7960);
+    let mut encode_avx2 = [None; 128];
+    for z in 0..0x8000u32 {
+        let slot = (z.min(0xDC0).max(z.saturating_sub(0x7000)) >> BLOCK_BITS) as usize;
+        let low = u8::try_from(d_of(z) - steps(z)).unwrap();
+        assert_eq!(*encode_avx2[slot].get_or_insert(low), low, "z {z:#x}");
+    }
+    let encode_avx2 = encode_avx2.map(Option::unwrap);
 
-    let z7_repertoire = ranges_to_encode_repertoire(Z7_CHAR_RANGES);
+    // AVX-512 encode: cp = z + 0x2000 * (z >= 0xD40) + 32 * low, where low
+    // depends only on the block z >> 5. The 8 lows of
+    // each 1024 / 8 = 128 units of 8 blocks (u = z >> 8) form 22 distinct
+    // patterns, overlapped into one string of at most 128 bytes. A unit's
+    // start in it is stored biased by -8u (mod 128), so that adding the
+    // block's low 8 bits ((z >> 5) % 256 = 8 (u % 32) + b) gives start + b.
+    let unit_lows = |u: u32| -> Vec<u8> {
+        (0..8)
+            .map(|b| u8::try_from(d_of(u << 8 | b << 5) - high(u << 8 | b << 5)).unwrap())
+            .collect()
+    };
+    let (encode_offset, encode_start) = overlap_units(&unit_lows);
+    for z in 0..0x8000u32 {
+        let idx = (encode_start[(z >> 8) as usize] as u32 + (z >> 5 & 0xFF)) & 127;
+        let low = encode_offset[idx as usize] as u32;
+        let cp = (z + 0x2000 * (z >= 0xD40) as u32 + (low << BLOCK_BITS)) & 0xFFFF;
+        assert_eq!(cp, z15_cps[z as usize], "z {z:#x}");
+    }
+    // AVX-512 encode: each slot of the string instead holds the ID of the
+    // full offset cp - z (including the 0x2000 above 0xD40) of the blocks that
+    // use it. Those blocks share one offset, and the IDs index a dictionary
+    // of at most 64 offsets (one two-table vpermi2w).
+    let mut encode_offset_ids = vec![u8::MAX; 128];
+    let mut encode_offset_dict: Vec<u16> = vec![];
+    for z in (0..0x8000u32).step_by(BLOCK_SIZE as usize) {
+        let offset = (z15_cps[z as usize].wrapping_sub(z) & 0xFFFF) as u16;
+        let id = encode_offset_dict
+            .iter()
+            .position(|&x| x == offset)
+            .unwrap_or_else(|| {
+                encode_offset_dict.push(offset);
+                encode_offset_dict.len() - 1
+            }) as u8;
+        let slot = ((encode_start[(z >> 8) as usize] as u32 + (z >> 5 & 0xFF)) & 127) as usize;
+        assert!(
+            encode_offset_ids[slot] == u8::MAX || encode_offset_ids[slot] == id,
+            "slot {slot}"
+        );
+        encode_offset_ids[slot] = id;
+    }
+    assert!(
+        encode_offset_dict.len() <= 64,
+        "{} offsets",
+        encode_offset_dict.len()
+    );
+    encode_offset_dict.resize(64, 0);
+    for z in 0..0x8000u32 {
+        let slot = (encode_start[(z >> 8) as usize] as u32 + (z >> 5 & 0xFF)) & 127;
+        let offset = encode_offset_dict[(encode_offset_ids[slot as usize] & 63) as usize];
+        let cp = (z + offset as u32) & 0xFFFF;
+        assert_eq!(cp, z15_cps[z as usize], "z {z:#x}");
+    }
 
-    z7_repertoire.iter().enumerate().for_each(|(z, chr)| {
-        decode_lookup_table.insert(*chr, (7, z as u16));
-    });
+    // AVX-512 decode: z = cp - 32 * (blocks below cp's block that are not
+    // 15-bit), which holds because the 15-bit blocks are in ascending order.
+    // Per half page h (512 code points, 16 blocks): the bitmap of its 15-bit
+    // blocks and 32 * the non-15-bit blocks before it. The 128 half pages
+    // share 27 distinct entries (all halves without 15-bit blocks share one),
+    // so the SIMD code looks up an entry index and then the entry.
+    assert!(z15_blocks.is_sorted());
+    let is15 = |blk: u32| decode[(blk << BLOCK_BITS) as usize] < 0x8000;
+    let mut entries: Vec<(u16, u16)> = vec![(0, 0)];
+    let mut half_desc = [0u8; 128];
+    let mut missing = 0u32;
+    for h in 0..128u32 {
+        let mask = (0..16).fold(0u16, |m, i| m | (is15(h * 16 + i) as u16) << i);
+        let e = if mask == 0 {
+            (0, 0)
+        } else {
+            (mask, (missing << BLOCK_BITS) as u16)
+        };
+        missing += 16 - mask.count_ones();
+        let i = entries.iter().position(|&x| x == e).unwrap_or_else(|| {
+            entries.push(e);
+            entries.len() - 1
+        });
+        half_desc[h as usize] = i as u8;
+    }
+    // Entry indices are `vpermw` indices.
+    assert!(entries.len() <= 32, "{} half page entries", entries.len());
+    // The SIMD code computes t = 64 * b0 + b1 from the first two UTF-8 bytes
+    // with `vpmaddubsw`: t >> 3 is (cp >> 9) + 0x710 and t << 6 is
+    // cp + 0x2000 (mod 2^16). The tables absorb both offsets.
+    let mut half_desc_biased = vec![0u8; 128];
+    for h in 0..128 {
+        half_desc_biased[(h + 0x10) & 127] = half_desc[h];
+    }
+    // Counting missing blocks from the current block through the end of
+    // its half page lets decode use the shifted mask for both membership
+    // (bit zero) and rank (population count).
+    // Padded to 32 `vpermw` entries with half pages that have no 15-bit
+    // blocks.
+    entries.resize(32, (0, 0));
+    let missing_mask: Vec<_> = entries.iter().map(|&(mask, _)| !mask).collect();
+    // 32 * non-15-bit blocks through the end of the half page, + 0x2000.
+    let end_offset: Vec<_> = entries
+        .iter()
+        .map(|&(mask, offset)| {
+            offset
+                .wrapping_add(0x2000)
+                .wrapping_add(32 * (16 - mask.count_ones()) as u16)
+        })
+        .collect();
+    for cp in 0x800..0x10000u32 {
+        let (b0, b1) = (0xE0 | cp >> 12, 0x80 | (cp >> 6 & 0x3F));
+        let t = 64 * b0 + b1;
+        let i = half_desc_biased[(t >> 3 & 127) as usize] as usize;
+        let cp_adj = (t << 6 | (cp & 0x3F)) & 0xFFFF;
+        let suffix = missing_mask[i] >> (cp_adj >> 5 & 15);
+        assert_eq!(suffix & 1 == 0, decode[cp as usize] < 0x8000, "U+{cp:04X}");
+        if suffix & 1 == 0 {
+            let z = cp_adj
+                .wrapping_sub(end_offset[i] as u32)
+                .wrapping_add(32 * suffix.count_ones())
+                & 0xFFFF;
+            assert_eq!(z, decode[cp as usize] as u32, "U+{cp:04X}");
+        }
+    }
 
-    let const_declarations = [
-        const_declaration!(pub Z15_REPERTOIRE = z15_repertoire),
-        const_declaration!(pub Z7_REPERTOIRE = z7_repertoire),
-        const_declaration!(pub DECODE_LOOKUP_TABLE = decode_lookup_table),
-    ]
-    .join("\n");
+    // NEON decode: rank queries per 256-code-point page
+    // P (8 blocks), so that masks and popcounts are bytes. Per page: its
+    // missing (non-15-bit) blocks, and the missing blocks below its end minus
+    // 224 (end 0 when no block is 15-bit). With D = (cp - z) / 32, D - 224
+    // fits in an i8 for every 3-byte 15-bit character, so z = cp - 0x1C00 -
+    // 32 * (end - popcount(missing >> block)). The 256 pages are overlapped
+    // per group of 4 into at most 64 entries; the start of group g is biased
+    // by -4g (mod 256), so page P is entry NEON_PAGE_START[P >> 2] + P.
+    let page_entry = |p: u32| -> (u8, u8) {
+        let missing = (0..8).fold(0u8, |m, i| m | (!is15(8 * p + i) as u8) << i);
+        let below = (0..8 * p + 8).filter(|&blk| !is15(blk)).count() as i32;
+        if missing == 0xFF {
+            (0xFF, 0)
+        } else {
+            (missing, (below - 224) as u8)
+        }
+    };
+    let groups: Vec<Vec<(u8, u8)>> = (0..64)
+        .map(|g| (4 * g..4 * g + 4).map(page_entry).collect())
+        .collect();
+    let pages = superstring(&groups);
+    assert!(pages.len() <= 64, "{} page entries", pages.len());
+    let neon_page_start: Vec<u8> = groups
+        .iter()
+        .enumerate()
+        .map(|(g, p)| {
+            let s = pages.windows(4).position(|w| w == &p[..]).unwrap();
+            (s as u32).wrapping_sub(4 * g as u32) as u8
+        })
+        .collect();
+    let mut neon_page_missing: Vec<u8> = pages.iter().map(|&(m, _)| m).collect();
+    let mut neon_page_end: Vec<u8> = pages.iter().map(|&(_, e)| e).collect();
+    neon_page_missing.resize(64, 0xFF);
+    neon_page_end.resize(64, 0);
+    // 2-byte characters use the same tables: D + 32 (69..=88) fits in an
+    // i8 and equals D - 224 mod 256, so z = cp + 0x400 - 32 * delta.
+    for cp in 0x80..0x10000u32 {
+        let (hi, lo) = (cp >> 8, cp & 0xFF);
+        let page = neon_page_start[(hi >> 2) as usize].wrapping_add(hi as u8) as usize;
+        assert!(page < pages.len());
+        let suffix = neon_page_missing[page] >> (lo >> 5);
+        let z = decode[cp as usize] as u32;
+        assert_eq!(suffix & 1 == 0, z < 0x8000, "U+{cp:04X}");
+        if suffix & 1 == 0 {
+            let (bias, adj) = if cp < 0x800 {
+                (32, -0x400)
+            } else {
+                (-224, 0x1C00)
+            };
+            assert!(
+                (-128..128).contains(&((cp as i32 - z as i32) / 32 + bias)),
+                "U+{cp:04X}"
+            );
+            let delta = neon_page_end[page].wrapping_sub(suffix.count_ones() as u8) as i8;
+            let neon_z = (cp as i32 - adj - 32 * delta as i32) as u32 & 0xFFFF;
+            assert_eq!(neon_z, z, "U+{cp:04X}");
+        }
+    }
+
+    // AVX-512 decode of 2-byte characters: the 224 2-byte 15-bit characters
+    // (z < 224) are the first 7 blocks, all below U+0800. Indexed by cp >> 5
+    // (a 2-byte code point has 11 bits): 32 * the block's index (the z of its
+    // first character), or 0xFF (odd, unlike every valid entry).
+    let mut decode_2byte_block = vec![0xFFu8; 64];
+    for (k, &blk) in z15_blocks.iter().enumerate().take(7) {
+        assert!(blk < 0x800);
+        decode_2byte_block[(blk >> BLOCK_BITS) as usize] = (k as u8) << 5;
+    }
+    assert!(z15_blocks[7] >= 0x800);
+
+    // Encode tables: packed UTF-8 for every value.
+    let expand =
+        |blocks: &[u32]| -> Vec<u32> { chars(blocks).into_iter().map(packed_utf8).collect() };
+    let z15_utf8 = expand(&z15_blocks);
+    let z7_utf8 = expand(&z7_blocks);
+
+    // AVX-512 encode of blocks of 2-byte characters (z < 224, the first 7
+    // blocks): the UTF-8 bytes (b0, b1) of a block's first character as a
+    // little-endian u16. Within a block only the low 5 bits of b1 change,
+    // and they equal those of z.
+    let mut encode_2byte_prefix = vec![0u16; 8];
+    for (i, prefix) in encode_2byte_prefix.iter_mut().take(7).enumerate() {
+        *prefix = z15_utf8[i << BLOCK_BITS] as u16;
+    }
+    for z in 0..224 {
+        let packed = encode_2byte_prefix[z >> BLOCK_BITS] as u32 | ((z as u32 & 31) << 8);
+        assert_eq!(packed | 2 << 24, z15_utf8[z], "z {z}");
+    }
+
+    // Large tables are emitted as `static` so each exists exactly once in the binary.
+    let mut out = String::new();
+    write_array(
+        &mut out,
+        "/// Packed UTF-8 (`len << 24 | le_bytes`) of the character for each 15-bit value.",
+        "Z15_UTF8",
+        "u32",
+        &z15_utf8,
+    );
+    write_array(
+        &mut out,
+        "/// Packed UTF-8 (`len << 24 | le_bytes`) of the character for each 7-bit value.",
+        "Z7_UTF8",
+        "u32",
+        &z7_utf8,
+    );
+    // The same characters as `char`s, for the safe-only implementation.
+    for (name, bits, cps) in [
+        ("Z15_CHAR", 15, &z15_cps),
+        ("Z7_CHAR", 7, &chars(&z7_blocks)),
+    ] {
+        writeln!(out, "/// The character for each {bits}-bit value.").unwrap();
+        writeln!(out, "pub static {name}: [char; {}] = [", cps.len()).unwrap();
+        for chunk in cps.chunks(16) {
+            let line: Vec<String> = chunk.iter().map(|cp| format!("'\\u{{{cp:x}}}'")).collect();
+            writeln!(out, "    {},", line.join(", ")).unwrap();
+        }
+        writeln!(out, "];").unwrap();
+    }
+    write_array(
+        &mut out,
+        "/// Code point (U+0000..=U+FFFF) -> 0xFFFF (invalid), `0x8000 | z` (7-bit) or `z` (15-bit).",
+        "DECODE",
+        "u16",
+        &decode,
+    );
+
+    write_array(
+        &mut out,
+        "/// AVX2 encode offsets, by folded block (see build.rs).",
+        "ENCODE_AVX2",
+        "u8",
+        &encode_avx2,
+    );
+    write_array(
+        &mut out,
+        "/// AVX-512 encode: per 8-block unit, start in `ENCODE_OFFSET_IDS` - 8 * unit (mod 128).",
+        "ENCODE_START_BIASED",
+        "u8",
+        &encode_start,
+    );
+    write_array(
+        &mut out,
+        "/// AVX-512 encode: per slot, an `ENCODE_OFFSET_DICT` index (see build.rs).",
+        "ENCODE_OFFSET_IDS",
+        "u8",
+        &encode_offset_ids,
+    );
+    write_array(
+        &mut out,
+        "/// AVX-512 encode: full code point offsets cp - z.",
+        "ENCODE_OFFSET_DICT",
+        "u16",
+        &encode_offset_dict,
+    );
+    write_array(
+        &mut out,
+        "/// AVX-512 encode: UTF-8 (b0, b1) of the first character of each 2-byte block.",
+        "ENCODE_2BYTE_PREFIX",
+        "u16",
+        &encode_2byte_prefix,
+    );
+    write_array(
+        &mut out,
+        "/// AVX-512 decode: entry index of half page `(h + 16) % 128`.",
+        "HALF_DESC_BIASED",
+        "u8",
+        &half_desc_biased,
+    );
+    write_array(
+        &mut out,
+        "/// AVX-512 decode: 32 * the 2-byte 15-bit block index (0..=192) of cp >> 5, or 0xFF.",
+        "DECODE_2BYTE_BLOCK",
+        "u8",
+        &decode_2byte_block,
+    );
+    write_array(
+        &mut out,
+        "/// NEON decode: per group of 4 pages, start in `NEON_PAGE_*` - 4 * group (mod 256).",
+        "NEON_PAGE_START",
+        "u8",
+        &neon_page_start,
+    );
+    write_array(
+        &mut out,
+        "/// NEON decode: missing 15-bit blocks of each page entry.",
+        "NEON_PAGE_MISSING",
+        "u8",
+        &neon_page_missing,
+    );
+    write_array(
+        &mut out,
+        "/// NEON decode: non-15-bit blocks below each page entry's end, minus 224.",
+        "NEON_PAGE_END",
+        "u8",
+        &neon_page_end,
+    );
+
+    write_array(
+        &mut out,
+        "/// Missing 15-bit blocks per half-page entry.",
+        "MISSING_MASK",
+        "u16",
+        &missing_mask,
+    );
+    write_array(
+        &mut out,
+        "/// Biased offset through the end of a half page.",
+        "END_OFFSET_BIASED",
+        "u16",
+        &end_offset,
+    );
+    // A dword gather reads each 16-bit entry and the one after it.
+    let mut mixed_block: Vec<_> = decode.iter().step_by(32).copied().collect();
+    mixed_block.push(0xFFFF);
+    write_array(
+        &mut out,
+        "/// First value per 32 code points, plus gather padding.",
+        "DECODE_MIXED_BLOCK",
+        "u16",
+        &mixed_block,
+    );
 
     std::fs::write(
         format!("{}/table.rs", std::env::var("OUT_DIR").unwrap()),
-        const_declarations,
+        out,
     )
     .unwrap();
     println!("cargo::rerun-if-changed=build.rs");

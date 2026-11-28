@@ -1,9 +1,25 @@
+//! Base32768: binary data as UTF-16-friendly text, 15 bits per character.
+//!
+//! With the `safe-only` feature, the crate is built from safe Rust alone
+//! (`forbid(unsafe_code)`): the SIMD and pointer-based fast paths are not
+//! compiled, and a simpler implementation provides the same API and results.
+#![cfg_attr(feature = "safe-only", forbid(unsafe_code))]
+
 use thiserror::Error;
 
-const BITS_PER_CHAR: u8 = 15;
-const BITS_PER_BYTE: u8 = 8;
-
 use base32768_table as table;
+
+#[cfg(not(feature = "safe-only"))]
+mod fast;
+#[cfg(any(feature = "safe-only", test))]
+mod safe;
+#[cfg(not(feature = "safe-only"))]
+mod simd;
+
+#[cfg(not(feature = "safe-only"))]
+pub use fast::{decode, decode_into, encode, encode_into};
+#[cfg(feature = "safe-only")]
+pub use safe::{decode, decode_into, encode, encode_into};
 
 #[derive(Error, Debug)]
 pub enum DecodeError {
@@ -17,95 +33,23 @@ pub enum DecodeError {
     PaddingMismatch,
 }
 
-pub fn encode(b: &[u8]) -> String {
-    let mut s = String::new();
-    let mut z = 0u16;
-    let mut numZBits = 0;
+/// `table::DECODE` value for a code point that is not a Base32768 character.
+const INVALID: u32 = 0xFFFF;
+/// Set in `table::DECODE` values of 7-bit characters (and of `INVALID`).
+const FLAG7: u32 = 0x8000;
 
-    for uint8 in b {
-        for j in itertools::rev(0..BITS_PER_BYTE) {
-            let bit = (uint8 >> j) & 1;
-
-            z = (z << 1) + (bit as u16);
-            numZBits += 1;
-
-            if numZBits == BITS_PER_CHAR {
-                s.push(table::Z15_REPERTOIRE[z as usize]);
-                z = 0;
-                numZBits = 0;
-            }
-        }
-    }
-
-    if numZBits != 0 {
-        while !(numZBits == 7 || numZBits == 15) {
-            z = (z << 1) + 1;
-            numZBits += 1;
-        }
-
-        match numZBits {
-            7 => s.push(table::Z7_REPERTOIRE[z as usize]),
-            15 => s.push(table::Z15_REPERTOIRE[z as usize]),
-            _ => unreachable!(),
-        }
-    }
-
-    s
+/// Number of characters `encode` produces for `len` input bytes:
+/// `ceil(len * 8 / 15)`, computed without overflowing `len * 8`.
+#[inline]
+fn encoded_chars(len: usize) -> usize {
+    len / 15 * 8 + (len % 15 * 8).div_ceil(15)
 }
 
-pub fn decode(s: &str) -> Result<Vec<u8>, DecodeError> {
-    let length = s.chars().count();
-
-    let mut uint8Array: Vec<u8> =
-        Vec::with_capacity(length * BITS_PER_CHAR as usize / BITS_PER_BYTE as usize);
-
-    let mut uint8 = 0u8;
-    let mut numUint8Bits = 0;
-
-    for (i, chr) in s.chars().enumerate() {
-        let Some((numZBits, z)) = table::DECODE_LOOKUP_TABLE.get(&chr) else {
-            return Err(DecodeError::UnrecognizedCharacter(chr));
-        };
-
-        if *numZBits != BITS_PER_CHAR && i != length - 1 {
-            return Err(DecodeError::UnexpectedSecondaryCharacter(i));
-        }
-
-        for j in itertools::rev(0..*numZBits) {
-            let bit = (z >> j) & 1;
-
-            uint8 = (uint8 << 1) + (bit as u8);
-            numUint8Bits += 1;
-
-            if numUint8Bits == BITS_PER_BYTE {
-                uint8Array.push(uint8);
-                uint8 = 0;
-                numUint8Bits = 0;
-            }
-        }
-    }
-
-    if uint8 != ((1 << numUint8Bits) - 1) {
-        return Err(DecodeError::PaddingMismatch);
-    }
-
-    Ok(uint8Array)
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn test_decode() {
-        let encoded_s = "媒腻㐤┖ꈳ埳";
-        assert_eq!(
-            crate::decode(encoded_s).unwrap(),
-            [104, 101, 108, 108, 111, 32, 119, 111, 114, 108, 100]
-        );
-    }
-
-    #[test]
-    fn test_encode() {
-        let bin = [104, 101, 108, 108, 111, 32, 119, 111, 114, 108, 100];
-        assert_eq!(crate::encode(&bin), "媒腻㐤┖ꈳ埳");
-    }
+/// Output capacity `decode` needs for `len` bytes of input:
+/// `floor(len / 2 * 15 / 8) + 1`, computed without overflowing. Every character
+/// is at least 2 bytes and carries at most 15 bits; the result is below `len`.
+#[inline]
+fn decoded_capacity(len: usize) -> usize {
+    let chars = len / 2;
+    chars / 8 * 15 + chars % 8 * 15 / 8 + 1
 }
